@@ -62,6 +62,9 @@ enum { gAlwaysMove = false };
 #include <stdio.h>
 
 #include <hx/QuickVec.h>
+#include <thread>
+#include <cstdint>
+#include <inttypes.h>
 
 // #define HXCPP_GC_BIG_BLOCKS
 
@@ -194,17 +197,15 @@ static bool sGcVerifyGenerational = false;
 
 #if HX_HAS_ATOMIC && (HXCPP_GC_DEBUG_LEVEL==0) && !defined(HXCPP_GC_VERIFY) && !defined(EMSCRIPTEN)
   #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX)
-  enum { MAX_GC_THREADS = 4 };
+  enum { MAX_GC_THREADS = 32 };
   #else
-  enum { MAX_GC_THREADS = 2 };
+  enum { MAX_GC_THREADS = 12 };
   #endif
+  
+  // You can uncomment this for better call stacks if it crashes while collecting
+  #define HX_MULTI_THREAD_MARKING
 #else
   enum { MAX_GC_THREADS = 1 };
-#endif
-
-#if (MAX_GC_THREADS>1)
-   // You can uncomment this for better call stacks if it crashes while collecting
-   #define HX_MULTI_THREAD_MARKING
 #endif
 
 #ifdef PROFILE_THREAD_USAGE
@@ -592,8 +593,8 @@ typedef HxSemaphore ThreadPoolSignal;
 typedef TAutoLock<ThreadPoolLock> ThreadPoolAutoLock;
 
 // For threaded marking/block reclaiming
-static unsigned int sRunningThreads = 0;
-static unsigned int sAllThreads = 0;
+static uint64_t sRunningThreads = 0;
+static uint64_t sAllThreads = 0;
 static bool sLazyThreads = false;
 static bool sThreadPoolInit = false;
 
@@ -634,7 +635,7 @@ static inline void SignalThreadPool(ThreadPoolSignal &ioSignal, bool sThreadSlee
 
 static void wakeThreadLocked(int inThreadId)
 {
-   sRunningThreads |= (1<<inThreadId);
+   sRunningThreads |= (1ull<<inThreadId);
    sLazyThreads = sRunningThreads != sAllThreads;
    SignalThreadPool(sThreadWake[inThreadId],sThreadSleeping[inThreadId]);
 }
@@ -1561,13 +1562,13 @@ struct GlobalChunks
 
          #ifdef PROFILE_THREAD_USAGE
            #define CHECK_THREAD_WAKE(tid) \
-            if (MAX_GC_THREADS >tid && sgThreadCount>tid && (!(sRunningThreads & (1<<tid)))) { \
+           if (MAX_GC_THREADS >tid && sgThreadCount>tid && (!(sRunningThreads & (1ull<<tid)))) { \
             wakeThreadLocked(tid); \
             sThreadChunkWakes++; \
            } 
          #else
            #define CHECK_THREAD_WAKE(tid)  \
-            if (MAX_GC_THREADS >tid && sgThreadCount>tid && (!(sRunningThreads & (1<<tid)))) { \
+           if (MAX_GC_THREADS >tid && sgThreadCount>tid && (!(sRunningThreads & (1ull<<tid)))) { \
             wakeThreadLocked(tid); \
            }
          #endif
@@ -1697,12 +1698,12 @@ struct GlobalChunks
 
    void completeThreadLocked(int inThreadId)
    {
-      if (!(sRunningThreads & (1<<inThreadId)))
+      if (!(sRunningThreads & (1ull<<inThreadId)))
       {
          printf("Complete non-running thread?\n");
          DebuggerTrap();
       }
-      sRunningThreads &= ~(1<<inThreadId);
+      sRunningThreads &= ~(1ull<<inThreadId);
       sLazyThreads = sRunningThreads != sAllThreads;
 
       if (!sRunningThreads)
@@ -1722,7 +1723,7 @@ struct GlobalChunks
          {
             for(int spinCount = 0; spinCount<10000; spinCount++)
             {
-               if ( sgThreadPoolAbort || sAllThreads == (1<<inThreadId) )
+               if ( sgThreadPoolAbort || sAllThreads == (1ull<<inThreadId) )
                   break;
                if (processList)
                {
@@ -1952,7 +1953,7 @@ public:
              if (obj)
              {
                 obj->__Mark(this);
-                #if HX_MULTI_THREAD_MARKING
+                #ifdef HX_MULTI_THREAD_MARKING
                 // Load balance
                 if (sLazyThreads && marking->count>32)
                 {
@@ -4459,9 +4460,9 @@ public:
    void finishThreadJob(int inId)
    {
       ThreadPoolAutoLock l(sThreadPoolLock);
-      if (sRunningThreads & (1<<inId))
+      if (sRunningThreads & (1ull<<inId))
       {
-         sRunningThreads &= ~(1<<inId);
+         sRunningThreads &= ~(1ull<<inId);
          sLazyThreads = sRunningThreads != sAllThreads;
 
          if (!sRunningThreads)
@@ -4484,12 +4485,12 @@ public:
          // May be woken multiple times if sRunningThreads is set to 0 then 1 before we sleep
          sThreadSleeping[inId] = true;
          // Spurious wake?
-         while( !(sRunningThreads & (1<<inId) ) )
+         while( !(sRunningThreads & (1ull<<inId) ) )
             WaitThreadLocked(sThreadWake[inId]);
          sThreadSleeping[inId] = false;
       }
       #else
-      while( !(sRunningThreads & (1<<inId) ) )
+      while( !(sRunningThreads & (1ull<<inId) ) )
          sThreadWake[inId].Wait();
       #endif
    }
@@ -4504,7 +4505,7 @@ public:
          waitForThreadWake(inId);
 
          #ifdef HXCPP_GC_VERIFY
-         if (! (sRunningThreads & (1<<inId)) )
+         if (! (sRunningThreads & (1ull<<inId)) )
             printf("Bad running threads!\n");
          #endif
 
@@ -4632,13 +4633,20 @@ public:
 
       sgThreadPoolJob = inJob;
 
-      sgThreadCount = inThreadLimit<0 ? MAX_GC_THREADS : std::min((int)MAX_GC_THREADS, inThreadLimit) ;
+      {
+         unsigned int hw = std::thread::hardware_concurrency();
+         unsigned int cap = hw ? std::min((unsigned int)MAX_GC_THREADS, hw) : (unsigned int)MAX_GC_THREADS;
+         if (inThreadLimit < 0)
+            sgThreadCount = (int)cap;
+         else
+            sgThreadCount = std::min((int)cap, inThreadLimit);
+      }
 
       int start = std::min(inWorkers, sgThreadCount );
 
-      sAllThreads = (1<<sgThreadCount) - 1;
+      sAllThreads = (uint64_t(1) << sgThreadCount) - 1;
 
-      sRunningThreads = (1<<start) - 1;
+      sRunningThreads = (uint64_t(1) << start) - 1;
 
       sLazyThreads = sRunningThreads != sAllThreads;
 
@@ -4664,7 +4672,7 @@ public:
 
          if (sRunningThreads)
          {
-            printf("Bad thread stop %d\n", sRunningThreads);
+            printf("Bad thread stop %" PRIu64 "\n", sRunningThreads);
             DebuggerTrap();
          }
       }
@@ -7136,4 +7144,3 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 
 
 void DummyFunction(void *inPtr) { }
-
