@@ -232,6 +232,7 @@ enum
    MEM_INFO_RESERVED = 1,
    MEM_INFO_CURRENT = 2,
    MEM_INFO_LARGE = 3,
+   MEM_INFO_PROCESS = 4,
 };
 
 enum GcMode
@@ -7005,6 +7006,82 @@ int   __hxcpp_gc_reserved_bytes()
    return sGlobalAlloc->MemReserved();
 }
 
+static size_t __hxcpp_process_used_bytes()
+{
+   #ifdef HX_WINDOWS
+   static int s_winMemMode = 0; // -1=init, 0=WorkingSetSize, 1=PrivateUsage
+
+   PROCESS_MEMORY_COUNTERS pmc;
+   SIZE_T sz = sizeof(pmc);
+   if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, (DWORD)sz))
+   {
+      if (s_winMemMode==1) return (size_t)pmc.PagefileUsage;
+      return (size_t)pmc.WorkingSetSize;
+   }
+
+   return 0;
+   #elif defined(HX_MACOS) || defined(HX_IOS)
+   mach_task_basic_info info;
+   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+   if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+      return (size_t)info.resident_size;
+   return 0;
+   #elif defined(HX_LINUX) || defined(HX_ANDROID)
+   // Try /proc/self/status for VmRSS
+   {
+      FILE *f = fopen("/proc/self/status", "r");
+      if (f)
+      {
+         char line[256];
+         while (fgets(line, sizeof(line), f))
+         {
+            if (strncmp(line, "VmRSS:", 6) == 0)
+            {
+               // Format: "VmRSS:  123456 kB"
+               char *p = line + 6;
+               while (*p && (*p < '0' || *p > '9')) p++;
+               long long kb = 0;
+               if (sscanf(p, "%lld", &kb) == 1)
+               {
+                  fclose(f);
+                  return (size_t)kb * 1024;
+               }
+               break;
+            }
+         }
+         fclose(f);
+      }
+   }
+   // Fallback: /proc/self/statm resident pages * page size
+   {
+      FILE *f = fopen("/proc/self/statm", "r");
+      if (f)
+      {
+         long long sizePages=0, residentPages=0;
+         if (fscanf(f, "%lld %lld", &sizePages, &residentPages) == 2)
+         {
+            fclose(f);
+            long pageSize2 = sysconf(
+            #if defined(_SC_PAGESIZE)
+               _SC_PAGESIZE
+            #elif defined(_SC_PAGE_SIZE)
+               _SC_PAGE_SIZE
+            #else
+               -1
+            #endif
+            );
+            if (pageSize2 <= 0) pageSize2 = 4096;
+            return (size_t)residentPages * (size_t)pageSize2;
+         }
+         fclose(f);
+      }
+   }
+   return 0;
+   #else
+   return 0;
+   #endif
+}
+
 double __hxcpp_gc_mem_info(int inWhich)
 {
    switch(inWhich)
@@ -7017,6 +7094,8 @@ double __hxcpp_gc_mem_info(int inWhich)
          return (double)sGlobalAlloc->MemCurrent();
       case MEM_INFO_LARGE:
          return (double)sGlobalAlloc->MemLarge();
+      case MEM_INFO_PROCESS:
+         return (double)__hxcpp_process_used_bytes();
    }
    return 0;
 }
