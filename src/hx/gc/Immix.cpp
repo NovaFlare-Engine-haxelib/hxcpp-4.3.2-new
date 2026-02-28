@@ -130,8 +130,8 @@ static void *sgObject_root = 0;
 
 // Optimization Globals
 static double sgMarkDeadline = 0.0;
-static double sgIncrementalBudget = 0.001; // 1ms default
-static int sgMarkCheckInterval = 128; // Increased from 64 for modern CPUs
+static double sgIncrementalBudget = 0.002; // 4ms default for better throughput
+static int sgMarkCheckInterval = 64; // Decreased for better responsiveness on mobile
 static int sgMinorGCCount = 0;
 static int sgMinorGCMaxConsecutive = 50; // Force full GC after 50 minors
 
@@ -2010,7 +2010,7 @@ public:
                  hx::HashRoot *hash = marking->hash;
                  int bucket = marking->currentBucket;
                  marking->count = 0;
-                 int next = hash->MarkStep(bucket, 64, this);
+                 int next = hash->MarkStep(bucket, 256, this);
                  if (next != -1)
                  {
                      MarkChunk *chunk = sGlobalChunks.alloc();
@@ -2182,8 +2182,15 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 
          unsigned int *pos = info->allocStart + startRow;
          unsigned int val = *pos;
-         while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
-            val = *pos;
+         unsigned int mask = gImmixStartFlag[start&127];
+         if (!(val & mask))
+         {
+            while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|mask) != val)
+            {
+               val = *pos;
+               if (val & mask) break;
+            }
+         }
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
@@ -2267,8 +2274,15 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 
       unsigned int *pos = info->allocStart + startRow;
       unsigned int val = *pos;
-      while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|gImmixStartFlag[start&127]) != val)
-         val = *pos;
+      unsigned int mask = gImmixStartFlag[start&127];
+      if (!(val & mask))
+      {
+         while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|mask) != val)
+         {
+            val = *pos;
+            if (val & mask) break;
+         }
+      }
       #ifdef HXCPP_GC_GENERATIONAL
       info->mHasSurvivor = true;
       #endif
@@ -4135,7 +4149,15 @@ public:
          unsigned int *srcStart = from->allocStart;
 
          // Scan nursery for survivors
-         for(int hole = 0; hole<from->mHoles; hole++)
+      // Optimisation: skip survivor check on mobile unless critical
+      static int sSurvivorSkipCount = 0;
+      if (++sSurvivorSkipCount < 4) // Only do this expensive scan every 4th minor GC
+      {
+         continue;
+      }
+      sSurvivorSkipCount = 0;
+
+      for(int hole = 0; hole<from->mHoles; hole++)
          {
             int start = from->mRanges[hole].start;
             int len = from->mRanges[hole].length;
@@ -5027,7 +5049,6 @@ public:
       
       // Resume or continue marking
       bool done = false;
-      int batchSize = 100; // Check time every N steps
       
       while(true)
       {
@@ -5650,7 +5671,7 @@ public:
 
       // This saves some running/stall time, but increases the total CPU usage
       // Delaying it until just before the block is used to improve the cache locality
-      backgroundProcessFreeList(true);
+      backgroundProcessFreeList(false); // Move to background thread
 
       mAllBlocksCount   = mAllBlocks.size();
       mCurrentRowsInUse = mRowsInUse;
