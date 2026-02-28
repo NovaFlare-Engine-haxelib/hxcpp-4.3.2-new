@@ -86,6 +86,10 @@ enum { gAlwaysMove = false };
 
 #include <vector>
 #include <stdio.h>
+#if defined(HX_LINUX) || defined(HX_ANDROID)
+#include <unistd.h>
+#endif
+
 
 #include <hx/QuickVec.h>
 #include "../Hash.h"
@@ -2784,8 +2788,8 @@ typedef hx::QuickVec< Finalizable > FinalizableList;
 FILE_SCOPE FinalizableList sFinalizableList;
 
 
-static double tFinalizers;
-static int finalizerCount;
+double tFinalizers;
+int finalizerCount;
 static int localCount;
 static int localObjects;
 static int localAllocs;
