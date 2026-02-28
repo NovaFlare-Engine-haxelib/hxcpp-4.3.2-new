@@ -360,10 +360,13 @@ enum
 #endif
 
 
+
+struct HashRoot;
+
 struct MarkChunk
 {
    enum { SIZE = 62 };
-   enum { OBJ_ARRAY_JOB = -1 };
+   enum { OBJ_ARRAY_JOB = -1, HASH_JOB = -2 };
 
    inline MarkChunk() : count(0), next(0) { }
 
@@ -376,6 +379,11 @@ struct MarkChunk
       {
          hx::Object **arrayBase;
          int        arrayElements;
+      };
+      struct
+      {
+         HashRoot *hash;
+         int        currentBucket;
       };
    };
    MarkChunk  *next;

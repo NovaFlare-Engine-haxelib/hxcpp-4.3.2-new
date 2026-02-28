@@ -244,6 +244,9 @@ void VisitClassStatics(hx::VisitContext *__inCtx);
 
 // Called by haxe/application code to mark allocations.
 //  "Object" allocs will recursively call __Mark
+struct HashRoot;
+HXCPP_EXTERN_CLASS_ATTRIBUTES void MarkHashAlloc(HashRoot *hash, hx::MarkContext *__inCtx);
+
 inline void MarkAlloc(void *inPtr ,hx::MarkContext *__inCtx);
 inline void MarkObjectAlloc(hx::Object *inPtr ,hx::MarkContext *__inCtx);
 
@@ -318,6 +321,28 @@ namespace hx
    #define HX_ENDIAN_MARK_ID_BYTE       -1
 #endif
 
+
+#if defined(__GNUC__) || defined(__clang__)
+   #ifndef HX_GCC_ATOMICS
+      #define HX_GCC_ATOMICS
+   #endif
+#elif defined(_MSC_VER)
+   #ifndef HX_MSVC_ATOMICS
+      #define HX_MSVC_ATOMICS
+      #include <intrin.h>
+   #endif
+#endif
+
+inline void AtomicSetMarkByte(unsigned char *ptr, unsigned char flag)
+{
+#if defined(HX_GCC_ATOMICS)
+   __atomic_fetch_or(ptr, flag, __ATOMIC_SEQ_CST);
+#elif defined(HX_MSVC_ATOMICS)
+   _InterlockedOr8((char volatile *)ptr, flag);
+#else
+   *ptr |= flag;
+#endif
+}
 
 
 // The gPauseForCollect bits will turn spaceEnd negative, and so force the slow path
@@ -456,15 +481,15 @@ typedef ImmixAllocator Ctx;
 
 #ifdef HXCPP_GC_GENERATIONAL
   #define HX_OBJ_WB_CTX(obj,value,ctx) { \
-        unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
-        if (mark == hx::gByteMarkID && value && !((unsigned char *)(value))[ HX_ENDIAN_MARK_ID_BYTE  ] ) { \
-            mark|=HX_GC_REMEMBERED; \
+        unsigned char *mark =  &((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
+        if (*mark == hx::gByteMarkID && value && !((unsigned char *)(value))[ HX_ENDIAN_MARK_ID_BYTE  ] ) { \
+            hx::AtomicSetMarkByte(mark, HX_GC_REMEMBERED); \
             ctx->pushReferrer(obj); \
      } }
   #define HX_OBJ_WB_PESSIMISTIC_CTX(obj,ctx) { \
-     unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
-     if (mark == hx::gByteMarkID)  { \
-        mark|=HX_GC_REMEMBERED; \
+     unsigned char *mark =  &((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
+     if (*mark == hx::gByteMarkID)  { \
+        hx::AtomicSetMarkByte(mark, HX_GC_REMEMBERED); \
         ctx->pushReferrer(obj); \
      } }
   // I'm not sure if this will ever trigger...
