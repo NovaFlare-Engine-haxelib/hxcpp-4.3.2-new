@@ -130,7 +130,7 @@ static void *sgObject_root = 0;
 
 // Optimization Globals
 static double sgMarkDeadline = 0.0;
-static double sgIncrementalBudget = 0.002; // 4ms default for better throughput
+static double sgIncrementalBudget = 0.001; // 1ms default for better throughput
 static int sgMarkCheckInterval = 64; // Decreased for better responsiveness on mobile
 static int sgMinorGCCount = 0;
 static int sgMinorGCMaxConsecutive = 50; // Force full GC after 50 minors
@@ -4286,6 +4286,9 @@ public:
 
    int releaseEmptyGroups(BlockDataStats &outStats, size_t releaseSize)
    {
+      // Cap release size to avoid massive stutters when returning memory to OS
+      if (releaseSize > 64*1024*1024) releaseSize = 64*1024*1024;
+
       int released=0;
       int groups=0;
       for(int i=0; i<mAllBlocks.size(); i++ )
@@ -5202,7 +5205,9 @@ public:
       if (sgIncContext.active)
       {
          generational = sgIncContext.generational;
-         if (MarkAllIncremental(generational, __hxcpp_time_stamp() + sgIncrementalBudget))
+         double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
+         
+         if (MarkAllIncremental(generational, deadline))
          {
              // Finished! Proceed to sweep
          }
@@ -5266,23 +5271,31 @@ public:
           STAMP(t1)
 
           // Start new collection
-          // Use dynamic budget for incremental marking
-          if (!MarkAllIncremental(generational, __hxcpp_time_stamp() + sgIncrementalBudget)) 
-          {
-             // Yield: Clean up thread locks and return
-             sgIsCollecting = false;
-             hx::gPauseForCollect = 0x00000000;
-             #ifndef HXCPP_SINGLE_THREADED_APP
-                for(int i=0;i<mLocalAllocs.size();i++)
-                {
-                   if (mLocalAllocs[i]!=this_local)
-                      ReleaseFromSafe(mLocalAllocs[i]);
-                }
-                if (!inLocked)
-                   gThreadStateChangeLock->Unlock();
-             #endif
-             return;
-          }
+      // Use dynamic budget for incremental marking
+      // Note: sgIncrementalBudget is the total time for the whole collection process, not just marking
+      double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
+      
+      if (!MarkAllIncremental(generational, deadline)) 
+      {
+         // Yield: Clean up thread locks and return
+         sgIsCollecting = false;
+         hx::gPauseForCollect = 0x00000000;
+         #ifndef HXCPP_SINGLE_THREADED_APP
+            for(int i=0;i<mLocalAllocs.size();i++)
+            {
+               if (mLocalAllocs[i]!=this_local)
+                  ReleaseFromSafe(mLocalAllocs[i]);
+            }
+            if (!inLocked)
+               gThreadStateChangeLock->Unlock();
+         #endif
+         return;
+      }
+      
+      if (__hxcpp_time_stamp() > deadline)
+      {
+          compactSurviors = false;
+      }
       }
       #else
       // Non-generational fallback
@@ -5443,12 +5456,23 @@ public:
 
       int idx = 0;
       int l0 = mLargeList.size();
+      size_t freedLargeBytes = 0;
+      const size_t maxLargeFreeBytes = 64 * 1024 * 1024; // Limit large object free per GC
+
       while(idx<mLargeList.size())
       {
          unsigned int *blob = mLargeList[idx];
          if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
          {
             unsigned int size = *blob;
+            
+            // Incremental sweep: if we freed too much, defer the rest to next GC
+            if (freedLargeBytes > maxLargeFreeBytes)
+            {
+               idx++;
+               continue;
+            }
+
             mLargeAllocated -= size;
             if (size < recycleRemaining)
             {
@@ -5458,6 +5482,7 @@ public:
             else
             {
                HxFree(blob);
+               freedLargeBytes += size;
             }
 
             mLargeList.qerase(idx);
