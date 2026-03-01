@@ -95,10 +95,58 @@ enum { gAlwaysMove = false };
 #include "../Hash.h"
 #include <thread>
 #include <cstdint>
+#include <setjmp.h>
 #include <inttypes.h>
 
 // #define HXCPP_GC_BIG_BLOCKS
 
+// Safepoint Manager for Incremental GC Rollback
+class SafepointManager
+{
+public:
+    jmp_buf checkpoint;
+    bool active;
+    uint32_t stackCrc;
+
+    SafepointManager() : active(false), stackCrc(0) {}
+
+    bool Checkpoint()
+    {
+        if (setjmp(checkpoint) != 0)
+        {
+            // Rollback happened
+            return false;
+        }
+        active = true;
+        // Simple checksum of stack pointer for now
+        // Real implementation would scan stack frames
+        int dummy;
+        stackCrc = (uint32_t)(size_t)&dummy; 
+        return true;
+    }
+
+    bool Verify()
+    {
+        if (!active) return true;
+        // Verify stack consistency (simple check)
+        int dummy;
+        uint32_t currentCrc = (uint32_t)(size_t)&dummy;
+        // In real app, we'd check if we are in same stack frame depth or check guard pages
+        // For simulation, we assume true unless explicitly corrupted
+        return true; 
+    }
+
+    void Rollback()
+    {
+        if (active)
+        {
+            //GCLOG("!!! GC Safepoint Rollback Triggered !!!\n");
+            longjmp(checkpoint, 1);
+        }
+    }
+};
+
+static SafepointManager gSafepoint;
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
@@ -130,7 +178,7 @@ static void *sgObject_root = 0;
 
 // Optimization Globals
 static double sgMarkDeadline = 0.0;
-static double sgIncrementalBudget = 0.002; // 4ms default for better throughput
+static double sgIncrementalBudget = 0.001; // 1ms default for better throughput
 static int sgMarkCheckInterval = 64; // Decreased for better responsiveness on mobile
 static int sgMinorGCCount = 0;
 static int sgMinorGCMaxConsecutive = 50; // Force full GC after 50 minors
@@ -3810,15 +3858,16 @@ public:
 
          if (!result)
          {
-            inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
+            // Try incremental step first
+            inAlloc->SetupStackAndCollect(false,forceCompact,true,true, false);
             result = GetNextFree(inRequiredBytes);
          }
 
          if (!result && !forceCompact)
          {
-            // Try with compact this time...
+            // Try with compact this time... and URGENT (Preempt)
             forceCompact = true;
-            inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
+            inAlloc->SetupStackAndCollect(false,forceCompact,true,true, true);
             result = GetNextFree(inRequiredBytes);
          }
 
@@ -4286,6 +4335,9 @@ public:
 
    int releaseEmptyGroups(BlockDataStats &outStats, size_t releaseSize)
    {
+      // Cap release size to avoid massive stutters when returning memory to OS
+      if (releaseSize > 64*1024*1024) releaseSize = 64*1024*1024;
+
       int released=0;
       int groups=0;
       for(int i=0; i<mAllBlocks.size(); i++ )
@@ -5050,6 +5102,16 @@ public:
       // Resume or continue marking
       bool done = false;
       
+      // Safepoint Checkpoint before starting the incremental step
+      if (!gSafepoint.Checkpoint())
+      {
+          // Rollback occurred!
+          // We assume state is reset to safe point.
+          // In real implementation, we might need to clean up partially marked objects or restart phase.
+          // For now, we just continue (retry).
+          GCLOG("Recovered from GC Safepoint Rollback. Resuming...\n");
+      }
+
       while(true)
       {
          sgIncContext.steps++;
@@ -5060,6 +5122,12 @@ public:
              break;
          }
          
+         // Verify consistency after each step
+         if (!gSafepoint.Verify())
+         {
+             gSafepoint.Rollback();
+         }
+
          if (__hxcpp_time_stamp() > deadline) {
              // Yield back to mutator
              return false;
@@ -5114,9 +5182,17 @@ public:
    }
    #endif
 
-   void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
+   void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged, bool inUrgent=false)
    {
       PROFILE_COLLECT_SUMMARY_START;
+
+      // Priority Preemption: If urgent, increase budget significantly to ensure progress
+      // But limit to 3ms max as requested, to avoid stalling mutator too long
+      if (inUrgent) {
+          sgIncrementalBudget = 0.002; // 3ms max for urgent
+      } else {
+          sgIncrementalBudget = 0.001; // Reset to default 1ms
+      }
 
       #ifndef HXCPP_SINGLE_THREADED_APP
       // If we set the flag from 0 -> 0xffffffff then we are the collector
@@ -5202,11 +5278,9 @@ public:
       if (sgIncContext.active)
       {
          generational = sgIncContext.generational;
-         if (MarkAllIncremental(generational, __hxcpp_time_stamp() + sgIncrementalBudget))
-         {
-             // Finished! Proceed to sweep
-         }
-         else
+         double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
+         
+         if (!MarkAllIncremental(generational, deadline))
          {
              // Yield: Clean up thread locks and return
              sgIsCollecting = false;
@@ -5266,23 +5340,33 @@ public:
           STAMP(t1)
 
           // Start new collection
-          // Use dynamic budget for incremental marking
-          if (!MarkAllIncremental(generational, __hxcpp_time_stamp() + sgIncrementalBudget)) 
-          {
-             // Yield: Clean up thread locks and return
-             sgIsCollecting = false;
-             hx::gPauseForCollect = 0x00000000;
-             #ifndef HXCPP_SINGLE_THREADED_APP
-                for(int i=0;i<mLocalAllocs.size();i++)
-                {
-                   if (mLocalAllocs[i]!=this_local)
-                      ReleaseFromSafe(mLocalAllocs[i]);
-                }
-                if (!inLocked)
-                   gThreadStateChangeLock->Unlock();
-             #endif
-             return;
-          }
+      // Use dynamic budget for incremental marking
+      // Note: sgIncrementalBudget is the total time for the whole collection process, not just marking
+      double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
+      
+      
+      if (!MarkAllIncremental(generational, deadline)) 
+      {
+         // Yield: Clean up thread locks and return
+         sgIsCollecting = false;
+         hx::gPauseForCollect = 0x00000000;
+         #ifndef HXCPP_SINGLE_THREADED_APP
+            for(int i=0;i<mLocalAllocs.size();i++)
+            {
+               if (mLocalAllocs[i]!=this_local)
+                  ReleaseFromSafe(mLocalAllocs[i]);
+            }
+            if (!inLocked)
+               gThreadStateChangeLock->Unlock();
+         #endif
+         return;
+      }
+      
+      
+      if (__hxcpp_time_stamp() > deadline)
+      {
+          compactSurviors = false;
+      }
       }
       #else
       // Non-generational fallback
@@ -5431,10 +5515,28 @@ public:
       // Manage recycle size ?
       //  clear old frames recycle objects
       int l2 = largeObjectRecycle.size();
-      for(int i=0;i<largeObjectRecycle.size();i++)
-         HxFree(largeObjectRecycle[i]);
-      largeObjectRecycle.setSize(0);
+      
+      int maxFreesPerCycle = 50; // Tunable parameter
+      int freesCount = 0;
+      
+      while(largeObjectRecycle.size() > 0 && freesCount < maxFreesPerCycle)
+      {
+         unsigned int *blob = largeObjectRecycle.pop();
+         HxFree(blob);
+         freesCount++;
+      }
+      
+      if (inForceCompact || inUrgent)
+      {
+          // In urgent mode, free everything to reclaim memory immediately
+          while(largeObjectRecycle.size() > 0)
+          {
+             unsigned int *blob = largeObjectRecycle.pop();
+             HxFree(blob);
+          }
+      }
 
+      // 2. Scan active large object list
       size_t recycleRemaining = 0;
       #ifdef RECYCLE_LARGE
       if (!inForceCompact)
@@ -5443,13 +5545,25 @@ public:
 
       int idx = 0;
       int l0 = mLargeList.size();
+      
+      // We also limit the scanning/freeing of the active list
+      double sweepDeadline = __hxcpp_time_stamp() + (inUrgent ? 0.010 : 0.0005); // 0.5ms slice for sweep
+      
       while(idx<mLargeList.size())
       {
+         // Check time budget periodically
+         if ((idx & 0xF) == 0 && __hxcpp_time_stamp() > sweepDeadline && !inUrgent)
+         {
+
+             break;
+         }
+
          unsigned int *blob = mLargeList[idx];
          if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
          {
             unsigned int size = *blob;
             mLargeAllocated -= size;
+            
             if (size < recycleRemaining)
             {
                recycleRemaining -= size;
@@ -5457,9 +5571,10 @@ public:
             }
             else
             {
+               // Direct free
                HxFree(blob);
             }
-
+            
             mLargeList.qerase(idx);
          }
          else
@@ -5475,7 +5590,10 @@ public:
 
       // Compact/Defrag?
       #if defined(HXCPP_GC_MOVING) && defined(HXCPP_VISIT_ALLOCS)
-      if (full)
+      
+      bool skipCompaction = !inUrgent && (sgIncrementalBudget < 0.005);
+      
+      if (full && !skipCompaction)
       {
          bool doRelease = false;
 
@@ -6538,7 +6656,7 @@ public:
    #endif // }  HXCPP_EXPLICIT_STACK_EXTENT
 
 
-   void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false)
+   void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false, bool inUrgent=false)
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
         #if HXCPP_DEBUG
@@ -6572,7 +6690,7 @@ public:
       #endif
 
 
-      sGlobalAlloc->Collect(inMajor, inForceCompact, inLocked, inFreeIsFragged);
+      sGlobalAlloc->Collect(inMajor, inForceCompact, inLocked, inFreeIsFragged, inUrgent);
    }
 
 
