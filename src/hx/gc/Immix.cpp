@@ -5280,7 +5280,15 @@ public:
          generational = sgIncContext.generational;
          double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
          
+<<<<<<< HEAD
          if (!MarkAllIncremental(generational, deadline))
+=======
+         if (MarkAllIncremental(generational, deadline))
+         {
+             // Finished! Proceed to sweep
+         }
+         else
+>>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
          {
              // Yield: Clean up thread locks and return
              sgIsCollecting = false;
@@ -5344,7 +5352,10 @@ public:
       // Note: sgIncrementalBudget is the total time for the whole collection process, not just marking
       double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
       
+<<<<<<< HEAD
       
+=======
+>>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
       if (!MarkAllIncremental(generational, deadline)) 
       {
          // Yield: Clean up thread locks and return
@@ -5362,7 +5373,10 @@ public:
          return;
       }
       
+<<<<<<< HEAD
       
+=======
+>>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
       if (__hxcpp_time_stamp() > deadline)
       {
           compactSurviors = false;
@@ -5545,10 +5559,16 @@ public:
 
       int idx = 0;
       int l0 = mLargeList.size();
+<<<<<<< HEAD
       
       // We also limit the scanning/freeing of the active list
       double sweepDeadline = __hxcpp_time_stamp() + (inUrgent ? 0.010 : 0.0005); // 0.5ms slice for sweep
       
+=======
+      size_t freedLargeBytes = 0;
+      const size_t maxLargeFreeBytes = 64 * 1024 * 1024; // Limit large object free per GC
+
+>>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
       while(idx<mLargeList.size())
       {
          // Check time budget periodically
@@ -5562,6 +5582,14 @@ public:
          if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
          {
             unsigned int size = *blob;
+            
+            // Incremental sweep: if we freed too much, defer the rest to next GC
+            if (freedLargeBytes > maxLargeFreeBytes)
+            {
+               idx++;
+               continue;
+            }
+
             mLargeAllocated -= size;
             
             if (size < recycleRemaining)
@@ -5573,6 +5601,7 @@ public:
             {
                // Direct free
                HxFree(blob);
+               freedLargeBytes += size;
             }
             
             mLargeList.qerase(idx);
