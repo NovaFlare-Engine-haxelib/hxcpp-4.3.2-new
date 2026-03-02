@@ -2177,10 +2177,11 @@ public:
              }
 
              // Prefetch next items in stack to reduce cache misses
-             if (marking->count >= 2) {
+             if (marking->count >= 4) {
                  #if defined(__GNUC__) || defined(__clang__)
-                 __builtin_prefetch(marking->stack[marking->count-1]);
+                 // Prefetch 2 items ahead (tuned for typical object sizes)
                  __builtin_prefetch(marking->stack[marking->count-2]);
+                 __builtin_prefetch(marking->stack[marking->count-3]);
                  #endif
              }
 
@@ -2327,14 +2328,15 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
          unsigned int *pos = info->allocStart + startRow;
          unsigned int val = *pos;
          unsigned int mask = gImmixStartFlag[start&127];
-         if (!(val & mask))
-         {
-            while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|mask) != val)
-            {
-               val = *pos;
-               if (val & mask) break;
-            }
-         }
+   // Use cached mask to avoid memory access
+   if ( !(val & mask) )
+   {
+      // Optimistic check first
+      if ( !(_hx_atomic_or((volatile int *)pos, (int)mask) & mask) )
+      {
+          // We set the bit, so we are the first one
+      }
+   }
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
