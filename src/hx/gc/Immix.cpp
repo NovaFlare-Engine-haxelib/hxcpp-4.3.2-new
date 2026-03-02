@@ -18,6 +18,16 @@
 #include <string>
 #include <stdlib.h>
 
+#if defined(_M_AMD64) || defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+   #include <emmintrin.h>
+   #define HXCPP_USE_SSE2
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+   #include <arm_neon.h>
+   #define HXCPP_USE_NEON
+#endif
+
 
 static bool sgIsCollecting = false;
 
@@ -1018,6 +1028,65 @@ struct BlockDataInfo
    void countRows(BlockDataStats &outStats)
    {
       unsigned char *rowMarked = mPtr->mRowMarked;
+      #ifdef HXCPP_USE_SSE2
+      __m128i vsum = _mm_setzero_si128();
+      __m128i vzero = _mm_setzero_si128();
+
+      // First 16 bytes - mask header
+      __m128i v = _mm_loadu_si128((__m128i*)rowMarked);
+      
+      #ifdef HXCPP_GC_BIG_BLOCKS
+      // Mask first 4 bytes (header lines = 4)
+      __m128i mask = _mm_setr_epi8(0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+      #else
+      // Mask first 2 bytes (header lines = 2)
+      __m128i mask = _mm_setr_epi8(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+      #endif
+      
+      v = _mm_and_si128(v, mask);
+      vsum = _mm_add_epi64(vsum, _mm_sad_epu8(v, vzero));
+
+      for(int i=16; i<IMMIX_LINES; i+=16)
+      {
+         v = _mm_loadu_si128((__m128i*)(rowMarked + i));
+         vsum = _mm_add_epi64(vsum, _mm_sad_epu8(v, vzero));
+      }
+
+      __m128i vhigh = _mm_unpackhi_epi64(vsum, vsum);
+      vsum = _mm_add_epi64(vsum, vhigh);
+      mUsedRows = _mm_cvtsi128_si32(vsum);
+
+      #elif defined(HXCPP_USE_NEON)
+      
+      uint16x8_t vsum = vdupq_n_u16(0);
+      uint8x16_t v = vld1q_u8(rowMarked);
+
+      // Mask header
+      #ifdef HXCPP_GC_BIG_BLOCKS
+      // 4 lines header
+      static const uint8_t mask_bytes[] = {0,0,0,0, 255,255,255,255, 255,255,255,255, 255,255,255,255};
+      #else
+      // 2 lines header
+      static const uint8_t mask_bytes[] = {0,0,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255};
+      #endif
+      
+      uint8x16_t mask = vld1q_u8(mask_bytes);
+      v = vandq_u8(v, mask);
+      vsum = vpadalq_u8(vsum, v);
+
+      for(int i=16; i<IMMIX_LINES; i+=16)
+      {
+         v = vld1q_u8(rowMarked + i);
+         vsum = vpadalq_u8(vsum, v);
+      }
+
+      // Horizontal sum
+      uint32x4_t vsum32 = vpaddlq_u16(vsum);
+      uint64x2_t vsum64 = vpaddlq_u32(vsum32);
+      mUsedRows = (int)(vgetq_lane_u64(vsum64, 0) + vgetq_lane_u64(vsum64, 1));
+
+      #else
+
       unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
 
       // TODO - sse/neon
@@ -1063,6 +1132,8 @@ struct BlockDataInfo
       #endif
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
+
+      #endif
       mUsedBytes = mUsedRows<<IMMIX_LINE_BITS;
 
       mZeroLock = 0;
@@ -1891,6 +1962,31 @@ struct GlobalChunks
             return result;
       }
       return alloc();
+   }
+
+   void trim()
+   {
+      // Called during STW/serial phase
+      MarkChunk *head = (MarkChunk *)freeList;
+      int count = 0;
+      MarkChunk *prev = 0;
+      while(head)
+      {
+         if (count >= 256) 
+         {
+             MarkChunk *toDelete = head;
+             head = head->next;
+             delete toDelete;
+             if (prev) prev->next = head;
+             else freeList = head;
+         }
+         else
+         {
+             prev = head;
+             head = head->next;
+             count++;
+         }
+      }
    }
 
 };
@@ -5267,6 +5363,8 @@ public:
             freeFraggedRows += mFreeBlocks[i]->GetFreeRows();
       }
 
+      size_t oldLargeAllocated = mLargeAllocated;
+
       // Now all threads have mTopOfStack & mBottomOfStack set.
       bool generational = false; 
 
@@ -5280,15 +5378,7 @@ public:
          generational = sgIncContext.generational;
          double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
          
-<<<<<<< HEAD
          if (!MarkAllIncremental(generational, deadline))
-=======
-         if (MarkAllIncremental(generational, deadline))
-         {
-             // Finished! Proceed to sweep
-         }
-         else
->>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
          {
              // Yield: Clean up thread locks and return
              sgIsCollecting = false;
@@ -5352,10 +5442,7 @@ public:
       // Note: sgIncrementalBudget is the total time for the whole collection process, not just marking
       double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
       
-<<<<<<< HEAD
       
-=======
->>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
       if (!MarkAllIncremental(generational, deadline)) 
       {
          // Yield: Clean up thread locks and return
@@ -5373,10 +5460,7 @@ public:
          return;
       }
       
-<<<<<<< HEAD
       
-=======
->>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
       if (__hxcpp_time_stamp() > deadline)
       {
           compactSurviors = false;
@@ -5559,16 +5643,10 @@ public:
 
       int idx = 0;
       int l0 = mLargeList.size();
-<<<<<<< HEAD
-      
-      // We also limit the scanning/freeing of the active list
       double sweepDeadline = __hxcpp_time_stamp() + (inUrgent ? 0.010 : 0.0005); // 0.5ms slice for sweep
-      
-=======
       size_t freedLargeBytes = 0;
       const size_t maxLargeFreeBytes = 64 * 1024 * 1024; // Limit large object free per GC
 
->>>>>>> dfa315af7b6dfdefb1b5025556d12fd11b13c802
       while(idx<mLargeList.size())
       {
          // Check time budget periodically
@@ -5763,7 +5841,7 @@ public:
       if (generational)
       {
          // TODO - include large too?
-         int retained = mRowsInUse - oldRowsInUse;
+         int retained = (int)(mRowsInUse - oldRowsInUse) + (int)((mLargeAllocated - oldLargeAllocated) >> IMMIX_LINE_BITS);
          int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - oldRowsInUse;
          if (space<retained)
             space = retained;
@@ -5869,6 +5947,7 @@ public:
       
       // Cleanup incremental context on full completion
       sgIncContext.reset();
+      hx::sGlobalChunks.trim();
 
 
       #ifdef HXCPP_GC_VERIFY
