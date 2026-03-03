@@ -28,6 +28,15 @@
    #define HXCPP_USE_NEON
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+   #define HX_PREFETCH(ptr) __builtin_prefetch((const void *)(ptr))
+#elif defined(_MSC_VER)
+   #include <xmmintrin.h>
+   #define HX_PREFETCH(ptr) _mm_prefetch((char *)(ptr), _MM_HINT_T0)
+#else
+   #define HX_PREFETCH(ptr)
+#endif
+
 
 static bool sgIsCollecting = false;
 
@@ -2178,11 +2187,9 @@ public:
 
              // Prefetch next items in stack to reduce cache misses
              if (marking->count >= 4) {
-                 #if defined(__GNUC__) || defined(__clang__)
                  // Prefetch 2 items ahead (tuned for typical object sizes)
-                 __builtin_prefetch(marking->stack[marking->count-2]);
-                 __builtin_prefetch(marking->stack[marking->count-3]);
-                 #endif
+                 HX_PREFETCH(marking->stack[marking->count-2]);
+                 HX_PREFETCH(marking->stack[marking->count-3]);
              }
 
              hx::Object *obj = marking->pop();
@@ -2545,12 +2552,18 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
          }
          else
          {
-            #if defined(__GNUC__) || defined(__clang__)
-            if (ptrI + 16 < end) {
-               __builtin_prefetch(ptrI[8]);
-               __builtin_prefetch(ptrI[12]);
+            if (ptrI + 32 < end) {
+               // Level 1: Prefetch pointers further ahead
+               HX_PREFETCH(ptrI + 16);
+               HX_PREFETCH(ptrI + 20);
+
+               // Level 2: Prefetch object headers (dereference pointers we hopefully just fetched)
+               // We look closer (e.g. +4 or +8) assuming ptrI[4] is already in cache
+               if (ptrI[4]) HX_PREFETCH(ptrI[4]);
+               if (ptrI[5]) HX_PREFETCH(ptrI[5]);
+               if (ptrI[6]) HX_PREFETCH(ptrI[6]);
+               if (ptrI[7]) HX_PREFETCH(ptrI[7]);
             }
-            #endif
 
             MARK_PTR_I;
             MARK_PTR_I;
@@ -2608,12 +2621,17 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
              }
          }
          
-         #if defined(__GNUC__) || defined(__clang__)
          if (ptrI + 32 < end) { // Safe prefetch distance
-            __builtin_prefetch(ptrI[16]);
-            __builtin_prefetch(ptrI[20]);
+            // Level 1: Prefetch pointers further ahead
+            HX_PREFETCH(ptrI + 16);
+            HX_PREFETCH(ptrI + 20);
+
+            // Level 2: Prefetch object headers
+            if (ptrI[4]) HX_PREFETCH(ptrI[4]);
+            if (ptrI[5]) HX_PREFETCH(ptrI[5]);
+            if (ptrI[6]) HX_PREFETCH(ptrI[6]);
+            if (ptrI[7]) HX_PREFETCH(ptrI[7]);
          }
-         #endif
 
          MARK_PTR_I;
          MARK_PTR_I;
