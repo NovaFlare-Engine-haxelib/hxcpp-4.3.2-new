@@ -1182,6 +1182,21 @@ struct BlockDataInfo
       unsigned char *rowMarked = mPtr->mRowMarked;
 
       int r = IMMIX_HEADER_LINES;
+      
+      #define SKIP_ZEROS(r) \
+         { \
+            /* SIMD Scan 16 bytes at a time */ \
+            while(r <= (IMMIX_LINES-16)) { \
+               unsigned int *p = (unsigned int *)(rowMarked+r); \
+               if ( (p[0] | p[1] | p[2] | p[3]) == 0 ) r += 16; \
+               else break; \
+            } \
+            while(r<(IMMIX_LINES-4) && *(int *)(rowMarked+r)==0 ) \
+               r += 4; \
+            while(r<(IMMIX_LINES) && rowMarked[r]==0) \
+               r++; \
+         }
+
       // Count unused rows ....
      
       // start on 4-byte boundary...
@@ -1191,10 +1206,7 @@ struct BlockDataInfo
       if (!rowMarked[r])
       #endif
       {
-         while(r<(IMMIX_LINES-4) && *(int *)(rowMarked+r)==0 )
-            r += 4;
-         while(r<(IMMIX_LINES) && rowMarked[r]==0)
-            r++;
+         SKIP_ZEROS(r);
       }
 
       if (r==IMMIX_LINES)
@@ -1276,10 +1288,7 @@ struct BlockDataInfo
                if (!rowMarked[r])
                #endif
                {
-                  while(r<(IMMIX_LINES-4) && *(int *)(rowMarked+r)==0 )
-                     r += 4;
-                  while(r<(IMMIX_LINES) && rowMarked[r]==0)
-                     r++;
+                  SKIP_ZEROS(r);
                }
                ranges[hole].length = r-start;
                hole++;
@@ -2430,10 +2439,10 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
       unsigned int mask = gImmixStartFlag[start&127];
       if (!(val & mask))
       {
-         while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|mask) != val)
+         // Optimistic check first
+         if ( !(_hx_atomic_or((volatile int *)pos, (int)mask) & mask) )
          {
-            val = *pos;
-            if (val & mask) break;
+             // We set the bit, so we are the first one
          }
       }
       #ifdef HXCPP_GC_GENERATIONAL
