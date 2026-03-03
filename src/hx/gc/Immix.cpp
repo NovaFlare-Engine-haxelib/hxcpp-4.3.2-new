@@ -2136,13 +2136,22 @@ public:
     {
        mDeadline = deadline;
        int checkCount = 0;
+       int checkInterval = sgMarkCheckInterval;
+
        while(true)
        {
-          if (deadline > 0.0 && ++checkCount > sgMarkCheckInterval)
+          if (deadline > 0.0 && ++checkCount > checkInterval)
           {
              checkCount = 0;
-             if (__hxcpp_time_stamp() > deadline)
+             double now = __hxcpp_time_stamp();
+             if (now > deadline)
                 return false;
+             
+             // Dynamic interval: check more often as we approach the deadline
+             if (deadline - now < sgIncrementalBudget * 0.5)
+                 checkInterval = 8;
+             else
+                 checkInterval = sgMarkCheckInterval;
           }
 
           if (!marking || !marking->count)
@@ -2187,18 +2196,35 @@ public:
 
           while(marking)
           {
-             if (deadline > 0.0 && ++checkCount > sgMarkCheckInterval)
+             if (deadline > 0.0 && ++checkCount > checkInterval)
              {
                 checkCount = 0;
-                if (__hxcpp_time_stamp() > deadline)
+                double now = __hxcpp_time_stamp();
+                if (now > deadline)
                    return false;
+
+                // Dynamic interval update inside hot loop
+                if (deadline - now < sgIncrementalBudget * 0.5)
+                   checkInterval = 8;
+                else
+                   checkInterval = sgMarkCheckInterval;
              }
 
-             // Prefetch next items in stack to reduce cache misses
+             // Enhanced prefetching for better cache performance
              if (marking->count >= 4) {
-                 // Prefetch 2 items ahead (tuned for typical object sizes)
+                 // Prefetch pointers in stack
                  HX_PREFETCH(marking->stack[marking->count-2]);
                  HX_PREFETCH(marking->stack[marking->count-3]);
+                 
+                 // Prefetch object content for next iteration
+                 hx::Object *next = marking->stack[marking->count-1];
+                 if (next) {
+                    #if defined(__GNUC__) || defined(__clang__)
+                    __builtin_prefetch((void*)next);
+                    #else
+                    HX_PREFETCH(next);
+                    #endif
+                 }
              }
 
              hx::Object *obj = marking->pop();
@@ -2611,7 +2637,7 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
              break; 
          }
 
-         if (__inCtx->mDeadline > 0.0 && ++loopCount > 64)
+         if (__inCtx->mDeadline > 0.0 && ++loopCount > 32)
          {
              loopCount = 0;
              double now = __hxcpp_time_stamp();
@@ -2635,11 +2661,11 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
             HX_PREFETCH(ptrI + 16);
             HX_PREFETCH(ptrI + 20);
 
-            // Level 2: Prefetch object headers
+            // Level 2: Enhanced object header prefetching
+            if (ptrI[0]) HX_PREFETCH(ptrI[0]);
             if (ptrI[4]) HX_PREFETCH(ptrI[4]);
-            if (ptrI[5]) HX_PREFETCH(ptrI[5]);
-            if (ptrI[6]) HX_PREFETCH(ptrI[6]);
-            if (ptrI[7]) HX_PREFETCH(ptrI[7]);
+            if (ptrI[8]) HX_PREFETCH(ptrI[8]);
+            if (ptrI[12]) HX_PREFETCH(ptrI[12]);
          }
 
          MARK_PTR_I;
