@@ -6,6 +6,13 @@
 #include "../Hash.h"
 #include "GcRegCapture.h"
 #include <hx/Unordered.h>
+#include "GCThreadPool.h"
+
+// Feature Flag for Background Incremental Compact
+bool sgUseIncrementalCompact = true;
+double sgIncrementalCompactStepMs = 5.0;
+
+static hx::GCThreadPool *sgGCThreadPool = 0;
 
 #ifdef EMSCRIPTEN
    #include <emscripten/stack.h>
@@ -4112,7 +4119,7 @@ public:
 
 
 
-   bool MoveBlocks(MoveBlockJob &inJob,BlockDataStats &ioStats)
+   bool MoveBlocks(MoveBlockJob &inJob,BlockDataStats &ioStats, double deadline = 0.0)
    {
       BlockData *dest = 0;
       BlockDataInfo *destInfo = 0;
@@ -4127,6 +4134,9 @@ public:
 
       while(true)
       {
+         if (deadline > 0.0 && __hxcpp_time_stamp() > deadline)
+            return false;
+
          BlockDataInfo *from = inJob.getFrom();
          if (!from)
             break;
@@ -5809,7 +5819,13 @@ public:
 
             MoveBlockJob job(mAllBlocks);
 
-            if (MoveBlocks(job,stats) || doRelease)
+            double deadline = 0.0;
+            if (sgUseIncrementalCompact) {
+                // Convert ms to seconds
+                deadline = __hxcpp_time_stamp() + (sgIncrementalCompactStepMs * 0.001);
+            }
+
+            if (MoveBlocks(job,stats, deadline) || doRelease)
             {
                if (doRelease)
                {
@@ -6046,13 +6062,54 @@ public:
       PROFILE_COLLECT_SUMMARY_END;
    }
 
+   // Task for Parallel Sweep
+   class ReclaimTask : public hx::GCTask {
+   public:
+      ReclaimTask(hx::QuickVec<BlockDataInfo *> &blocks, int start, int end, bool full)
+         : mBlocks(blocks), mStart(start), mEnd(end), mFull(full) {}
+
+      void Execute(int inThreadId) override {
+         BlockDataStats *stats = &sThreadBlockDataStats[inThreadId];
+         for(int i=mStart; i<mEnd; i++) {
+            if (mFull) mBlocks[i]->reclaim<true>(stats);
+            else mBlocks[i]->reclaim<false>(stats);
+         }
+      }
+      
+      hx::QuickVec<BlockDataInfo *> &mBlocks;
+      int mStart;
+      int mEnd;
+      bool mFull;
+   };
+
    void reclaimBlocks(bool full, BlockDataStats &outStats)
    {
       if (MAX_GC_THREADS>1)
       {
-         for(int i=0;i<MAX_GC_THREADS;i++)
-            sThreadBlockDataStats[i].clear();
-         StartThreadJobs(full ? tpjReclaimFull : tpjReclaim, mAllBlocks.size(), true);
+         if (!sgGCThreadPool) {
+             sgGCThreadPool = new hx::GCThreadPool(MAX_GC_THREADS);
+         }
+
+         // Create tasks with chunking to ensure even distribution
+         int blockSize = mAllBlocks.size();
+         // Use a reasonable chunk size, e.g., 32 blocks per task
+         int chunkSize = 32; 
+         int taskCount = (blockSize + chunkSize - 1) / chunkSize;
+         
+         // Clear thread stats
+         for(int i=0; i<MAX_GC_THREADS; i++)
+             sThreadBlockDataStats[i].clear();
+
+         for(int i=0; i<blockSize; i+=chunkSize) {
+            int end = i + chunkSize;
+            if (end > blockSize) end = blockSize;
+            
+            ReclaimTask *task = new ReclaimTask(mAllBlocks, i, end, full);
+            sgGCThreadPool->AddTask(task);
+         }
+         
+         sgGCThreadPool->WaitAll();
+
          outStats = sThreadBlockDataStats[0];
          for(int i=1;i<MAX_GC_THREADS;i++)
             outStats.add(sThreadBlockDataStats[i]);
@@ -7841,3 +7898,28 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 
 
 void DummyFunction(void *inPtr) { }
+
+namespace hx {
+
+void VerifyAfterSweep()
+{
+   if (sGlobalAlloc)
+   {
+      #ifdef HXCPP_GC_VERIFY
+      sGlobalAlloc->VerifyBlockOrder();
+      #endif
+   }
+}
+
+void VerifyAfterCompact()
+{
+   if (sGlobalAlloc)
+   {
+      #ifdef HXCPP_GC_VERIFY
+      sGlobalAlloc->VerifyBlockOrder();
+      #endif
+   }
+}
+
+} // namespace hx
+
