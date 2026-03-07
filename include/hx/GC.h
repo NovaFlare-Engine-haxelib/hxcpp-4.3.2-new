@@ -43,11 +43,6 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_target_free_space_percentage(int inPercentage);
-
-// Verification API
-HXCPP_EXTERN_CLASS_ATTRIBUTES void VerifyAfterSweep();
-HXCPP_EXTERN_CLASS_ATTRIBUTES void VerifyAfterCompact();
-
 HXCPP_EXTERN_CLASS_ATTRIBUTES bool __hxcpp_is_const_string(const ::String &inString);
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_gc_freeze(Dynamic inObject);
 

@@ -6,13 +6,6 @@
 #include "../Hash.h"
 #include "GcRegCapture.h"
 #include <hx/Unordered.h>
-#include "GCThreadPool.h"
-
-// Feature Flag for Background Incremental Compact
-bool sgUseIncrementalCompact = true;
-double sgIncrementalCompactStepMs = 5.0;
-
-static hx::GCThreadPool *sgGCThreadPool = 0;
 
 #ifdef EMSCRIPTEN
    #include <emscripten/stack.h>
@@ -4119,7 +4112,7 @@ public:
 
 
 
-   bool MoveBlocks(MoveBlockJob &inJob,BlockDataStats &ioStats, double deadline = 0.0)
+   bool MoveBlocks(MoveBlockJob &inJob,BlockDataStats &ioStats)
    {
       BlockData *dest = 0;
       BlockDataInfo *destInfo = 0;
@@ -4134,9 +4127,6 @@ public:
 
       while(true)
       {
-         if (deadline > 0.0 && __hxcpp_time_stamp() > deadline)
-            return false;
-
          BlockDataInfo *from = inJob.getFrom();
          if (!from)
             break;
@@ -4658,45 +4648,6 @@ public:
          mAllBlocks[i]->clearBlockMarks();
    }
 
-   // Task for Parallel Adjust Pointers
-   class ParallelAdjustTask : public hx::GCTask {
-   public:
-      ParallelAdjustTask(hx::QuickVec<BlockDataInfo *> &blocks, int start, int end, hx::VisitContext *ctx)
-         : mBlocks(blocks), mStart(start), mEnd(end), mCtx(ctx) {}
-
-      void Execute(int inThreadId) override {
-         for(int i=mStart; i<mEnd; i++) {
-            mBlocks[i]->VisitBlock(mCtx);
-         }
-      }
-      
-      hx::QuickVec<BlockDataInfo *> &mBlocks;
-      int mStart;
-      int mEnd;
-      hx::VisitContext *mCtx;
-   };
-
-   // Background Large Object Freeing Task
-   class BackgroundFreeTask : public hx::GCTask {
-   public:
-      BackgroundFreeTask(hx::QuickVec<unsigned int *> &list) {
-          // Use copy/swap idiom or manual copy since QuickVec doesn't have swap in some versions
-          int n = list.size();
-          mList.setSize(n);
-          for(int i=0; i<n; i++) mList[i] = list[i];
-          // Clear original list to indicate ownership transfer (simulated)
-          list.setSize(0);
-      }
-
-      void Execute(int inThreadId) override {
-         for(int i=0; i<mList.size(); i++) {
-             HxFree(mList[i]);
-         }
-      }
-      
-      hx::QuickVec<unsigned int *> mList;
-   };
-
    #ifdef HXCPP_VISIT_ALLOCS
    void VisitAll(hx::VisitContext *inCtx,bool inMultithread = false,hx::QuickVec<hx::Object *> *inRemembered = 0)
    {
@@ -4708,23 +4659,9 @@ public:
       }
       else if (MAX_GC_THREADS>1 && inMultithread && mAllBlocks.size())
       {
-         if (!sgGCThreadPool) {
-             sgGCThreadPool = new hx::GCThreadPool(MAX_GC_THREADS);
-         }
-
-         int blockSize = mAllBlocks.size();
-         int chunkSize = 32; 
-         int taskCount = (blockSize + chunkSize - 1) / chunkSize;
-         
-         for(int i=0; i<blockSize; i+=chunkSize) {
-            int end = i + chunkSize;
-            if (end > blockSize) end = blockSize;
-            
-            ParallelAdjustTask *task = new ParallelAdjustTask(mAllBlocks, i, end, inCtx);
-            sgGCThreadPool->AddTask(task);
-         }
-         
-         sgGCThreadPool->WaitAll();
+         sThreadVisitContext = inCtx;
+         StartThreadJobs(tpjVisitBlocks, mAllBlocks.size(), true);
+         sThreadVisitContext = 0;
       }
       else
          for(int i=0;i<mAllBlocks.size();i++)
@@ -5734,35 +5671,12 @@ public:
       
       int maxFreesPerCycle = 50; // Tunable parameter
       int freesCount = 0;
-
-      // Use background task to free large objects if possible
-      if (MAX_GC_THREADS > 1 && largeObjectRecycle.size() > 0)
+      
+      while(largeObjectRecycle.size() > 0 && freesCount < maxFreesPerCycle)
       {
-          if (!sgGCThreadPool) {
-              sgGCThreadPool = new hx::GCThreadPool(MAX_GC_THREADS);
-          }
-
-          hx::QuickVec<unsigned int *> freeList;
-          // Move up to 50 objects to background free list
-          while(largeObjectRecycle.size() > 0 && freesCount < maxFreesPerCycle) {
-              freeList.push(largeObjectRecycle.pop());
-              freesCount++;
-          }
-          
-          if (freeList.size() > 0) {
-              BackgroundFreeTask *task = new BackgroundFreeTask(freeList);
-              sgGCThreadPool->AddTask(task);
-              // Do NOT wait for completion, let it run in background
-          }
-      }
-      else
-      {
-          while(largeObjectRecycle.size() > 0 && freesCount < maxFreesPerCycle)
-          {
-             unsigned int *blob = largeObjectRecycle.pop();
-             HxFree(blob);
-             freesCount++;
-          }
+         unsigned int *blob = largeObjectRecycle.pop();
+         HxFree(blob);
+         freesCount++;
       }
       
       if (inForceCompact || inUrgent)
@@ -5895,13 +5809,7 @@ public:
 
             MoveBlockJob job(mAllBlocks);
 
-            double deadline = 0.0;
-            if (sgUseIncrementalCompact) {
-                // Convert ms to seconds
-                deadline = __hxcpp_time_stamp() + (sgIncrementalCompactStepMs * 0.001);
-            }
-
-            if (MoveBlocks(job,stats, deadline) || doRelease)
+            if (MoveBlocks(job,stats) || doRelease)
             {
                if (doRelease)
                {
@@ -6138,54 +6046,13 @@ public:
       PROFILE_COLLECT_SUMMARY_END;
    }
 
-   // Task for Parallel Sweep
-   class ReclaimTask : public hx::GCTask {
-   public:
-      ReclaimTask(hx::QuickVec<BlockDataInfo *> &blocks, int start, int end, bool full)
-         : mBlocks(blocks), mStart(start), mEnd(end), mFull(full) {}
-
-      void Execute(int inThreadId) override {
-         BlockDataStats *stats = &sThreadBlockDataStats[inThreadId];
-         for(int i=mStart; i<mEnd; i++) {
-            if (mFull) mBlocks[i]->reclaim<true>(stats);
-            else mBlocks[i]->reclaim<false>(stats);
-         }
-      }
-      
-      hx::QuickVec<BlockDataInfo *> &mBlocks;
-      int mStart;
-      int mEnd;
-      bool mFull;
-   };
-
    void reclaimBlocks(bool full, BlockDataStats &outStats)
    {
       if (MAX_GC_THREADS>1)
       {
-         if (!sgGCThreadPool) {
-             sgGCThreadPool = new hx::GCThreadPool(MAX_GC_THREADS);
-         }
-
-         // Create tasks with chunking to ensure even distribution
-         int blockSize = mAllBlocks.size();
-         // Use a reasonable chunk size, e.g., 32 blocks per task
-         int chunkSize = 32; 
-         int taskCount = (blockSize + chunkSize - 1) / chunkSize;
-         
-         // Clear thread stats
-         for(int i=0; i<MAX_GC_THREADS; i++)
-             sThreadBlockDataStats[i].clear();
-
-         for(int i=0; i<blockSize; i+=chunkSize) {
-            int end = i + chunkSize;
-            if (end > blockSize) end = blockSize;
-            
-            ReclaimTask *task = new ReclaimTask(mAllBlocks, i, end, full);
-            sgGCThreadPool->AddTask(task);
-         }
-         
-         sgGCThreadPool->WaitAll();
-
+         for(int i=0;i<MAX_GC_THREADS;i++)
+            sThreadBlockDataStats[i].clear();
+         StartThreadJobs(full ? tpjReclaimFull : tpjReclaim, mAllBlocks.size(), true);
          outStats = sThreadBlockDataStats[0];
          for(int i=1;i<MAX_GC_THREADS;i++)
             outStats.add(sThreadBlockDataStats[i]);
@@ -7974,28 +7841,3 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 
 
 void DummyFunction(void *inPtr) { }
-
-namespace hx {
-
-void VerifyAfterSweep()
-{
-   if (sGlobalAlloc)
-   {
-      #ifdef HXCPP_GC_VERIFY
-      sGlobalAlloc->VerifyBlockOrder();
-      #endif
-   }
-}
-
-void VerifyAfterCompact()
-{
-   if (sGlobalAlloc)
-   {
-      #ifdef HXCPP_GC_VERIFY
-      sGlobalAlloc->VerifyBlockOrder();
-      #endif
-   }
-}
-
-} // namespace hx
-
