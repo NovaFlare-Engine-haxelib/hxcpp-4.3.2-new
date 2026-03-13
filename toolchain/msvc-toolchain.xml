@@ -139,6 +139,7 @@
   <fromfile value="@"/>
   <outflag value="-out:"/>
   <flag value="user32.lib"/>
+  <flag value="psapi.lib"/>
   <libpathflag value="-libpath:"/>
 </linker>
 
@@ -161,6 +162,7 @@
   <libpathflag value="-libpath:"/>
   <flag value="-libpath:lib"/>
   <flag value="user32.lib"/>
+  <flag value="psapi.lib"/>
   <ext value=".exe"/>
   <outflag value="-out:"/>
 </linker>
@@ -193,6 +195,7 @@
   <flag value="-libpath:lib"/>
   <libpathflag value="-libpath:"/>
   <flag value="user32.lib"/>
+  <flag value="psapi.lib"/>
   <ext value=".exe"/>
   <outflag value="-out:"/>
 </linker>

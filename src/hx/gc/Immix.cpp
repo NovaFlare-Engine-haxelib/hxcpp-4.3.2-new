@@ -18,51 +18,8 @@
 #include <string>
 #include <stdlib.h>
 
-#if defined(_M_AMD64) || defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-   #include <emmintrin.h>
-   #define HXCPP_USE_SSE2
-#endif
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-   #include <arm_neon.h>
-   #define HXCPP_USE_NEON
-#endif
-
-#if defined(__GNUC__) || defined(__clang__)
-   #define HX_PREFETCH(ptr) __builtin_prefetch((const void *)(ptr))
-#elif defined(_MSC_VER)
-   #include <xmmintrin.h>
-   #define HX_PREFETCH(ptr) _mm_prefetch((char *)(ptr), _MM_HINT_T0)
-#else
-   #define HX_PREFETCH(ptr)
-#endif
-
 
 static bool sgIsCollecting = false;
-
-enum GCState { gcIdle, gcMarking, gcSweeping };
-static GCState sgGCState = gcIdle;
-
-// Incremental GC State
-struct IncrementalContext {
-    bool active;
-    bool generational;
-    double startTime;
-    int steps;
-    
-    // Saved state for resuming
-    hx::QuickVec<hx::Object *> rememberedSet;
-    
-    void reset() {
-        active = false;
-        generational = false;
-        steps = 0;
-        rememberedSet.setSize(0);
-    }
-};
-
-static IncrementalContext sgIncContext;
-
 
 namespace hx
 {
@@ -100,72 +57,18 @@ enum { gAlwaysMove = false };
 #ifdef HX_WINDOWS
 #include <windows.h>
 #include <psapi.h>
-#pragma comment(lib, "psapi.lib")
 #endif
 
 #include <vector>
 #include <stdio.h>
-#if defined(HX_LINUX) || defined(HX_ANDROID)
-#include <unistd.h>
-#endif
-
 
 #include <hx/QuickVec.h>
-#include "../Hash.h"
 #include <thread>
 #include <cstdint>
-#include <setjmp.h>
 #include <inttypes.h>
 
 // #define HXCPP_GC_BIG_BLOCKS
 
-// Safepoint Manager for Incremental GC Rollback
-class SafepointManager
-{
-public:
-    jmp_buf checkpoint;
-    bool active;
-    uint32_t stackCrc;
-
-    SafepointManager() : active(false), stackCrc(0) {}
-
-    bool Checkpoint()
-    {
-        if (setjmp(checkpoint) != 0)
-        {
-            // Rollback happened
-            return false;
-        }
-        active = true;
-        // Simple checksum of stack pointer for now
-        // Real implementation would scan stack frames
-        int dummy;
-        stackCrc = (uint32_t)(size_t)&dummy; 
-        return true;
-    }
-
-    bool Verify()
-    {
-        if (!active) return true;
-        // Verify stack consistency (simple check)
-        int dummy;
-        uint32_t currentCrc = (uint32_t)(size_t)&dummy;
-        // In real app, we'd check if we are in same stack frame depth or check guard pages
-        // For simulation, we assume true unless explicitly corrupted
-        return true; 
-    }
-
-    void Rollback()
-    {
-        if (active)
-        {
-            //GCLOG("!!! GC Safepoint Rollback Triggered !!!\n");
-            longjmp(checkpoint, 1);
-        }
-    }
-};
-
-static SafepointManager gSafepoint;
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
@@ -194,14 +97,6 @@ void DebuggerTrap()
 static bool sgAllocInit = 0;
 static bool sgInternalEnable = true;
 static void *sgObject_root = 0;
-
-// Optimization Globals
-static double sgMarkDeadline = 0.0;
-static double sgIncrementalBudget = 0.001; // 1ms default for better throughput
-static int sgMarkCheckInterval = 64; // Decreased for better responsiveness on mobile
-static int sgMinorGCCount = 0;
-static int sgMinorGCMaxConsecutive = 50; // Force full GC after 50 minors
-
 // With virtual inheritance, stack pointers can point to the middle of an object
 #ifdef _MSC_VER
 // MSVC optimizes by taking the address of an initernal data member
@@ -780,13 +675,6 @@ struct BlockDataStats
    int fraggedRows;
 };
 
-// --- Forward Declarations for Incremental GC ---
-namespace hx { 
-    void RunFinalizers(); 
-    extern double tFinalizers;
-    extern int finalizerCount;
-}
-
 static BlockDataStats sThreadBlockDataStats[MAX_GC_THREADS];
 #ifdef HXCPP_VISIT_ALLOCS
 static hx::VisitContext *sThreadVisitContext = 0;
@@ -1037,65 +925,6 @@ struct BlockDataInfo
    void countRows(BlockDataStats &outStats)
    {
       unsigned char *rowMarked = mPtr->mRowMarked;
-      #ifdef HXCPP_USE_SSE2
-      __m128i vsum = _mm_setzero_si128();
-      __m128i vzero = _mm_setzero_si128();
-
-      // First 16 bytes - mask header
-      __m128i v = _mm_loadu_si128((__m128i*)rowMarked);
-      
-      #ifdef HXCPP_GC_BIG_BLOCKS
-      // Mask first 4 bytes (header lines = 4)
-      __m128i mask = _mm_setr_epi8(0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-      #else
-      // Mask first 2 bytes (header lines = 2)
-      __m128i mask = _mm_setr_epi8(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-      #endif
-      
-      v = _mm_and_si128(v, mask);
-      vsum = _mm_add_epi64(vsum, _mm_sad_epu8(v, vzero));
-
-      for(int i=16; i<IMMIX_LINES; i+=16)
-      {
-         v = _mm_loadu_si128((__m128i*)(rowMarked + i));
-         vsum = _mm_add_epi64(vsum, _mm_sad_epu8(v, vzero));
-      }
-
-      __m128i vhigh = _mm_unpackhi_epi64(vsum, vsum);
-      vsum = _mm_add_epi64(vsum, vhigh);
-      mUsedRows = _mm_cvtsi128_si32(vsum);
-
-      #elif defined(HXCPP_USE_NEON)
-      
-      uint16x8_t vsum = vdupq_n_u16(0);
-      uint8x16_t v = vld1q_u8(rowMarked);
-
-      // Mask header
-      #ifdef HXCPP_GC_BIG_BLOCKS
-      // 4 lines header
-      static const uint8_t mask_bytes[] = {0,0,0,0, 255,255,255,255, 255,255,255,255, 255,255,255,255};
-      #else
-      // 2 lines header
-      static const uint8_t mask_bytes[] = {0,0,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255};
-      #endif
-      
-      uint8x16_t mask = vld1q_u8(mask_bytes);
-      v = vandq_u8(v, mask);
-      vsum = vpadalq_u8(vsum, v);
-
-      for(int i=16; i<IMMIX_LINES; i+=16)
-      {
-         v = vld1q_u8(rowMarked + i);
-         vsum = vpadalq_u8(vsum, v);
-      }
-
-      // Horizontal sum
-      uint32x4_t vsum32 = vpaddlq_u16(vsum);
-      uint64x2_t vsum64 = vpaddlq_u32(vsum32);
-      mUsedRows = (int)(vgetq_lane_u64(vsum64, 0) + vgetq_lane_u64(vsum64, 1));
-
-      #else
-
       unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
 
       // TODO - sse/neon
@@ -1141,8 +970,6 @@ struct BlockDataInfo
       #endif
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
-
-      #endif
       mUsedBytes = mUsedRows<<IMMIX_LINE_BITS;
 
       mZeroLock = 0;
@@ -1182,21 +1009,6 @@ struct BlockDataInfo
       unsigned char *rowMarked = mPtr->mRowMarked;
 
       int r = IMMIX_HEADER_LINES;
-      
-      #define SKIP_ZEROS(r) \
-         { \
-            /* SIMD Scan 16 bytes at a time */ \
-            while(r <= (IMMIX_LINES-16)) { \
-               unsigned int *p = (unsigned int *)(rowMarked+r); \
-               if ( (p[0] | p[1] | p[2] | p[3]) == 0 ) r += 16; \
-               else break; \
-            } \
-            while(r<(IMMIX_LINES-4) && *(int *)(rowMarked+r)==0 ) \
-               r += 4; \
-            while(r<(IMMIX_LINES) && rowMarked[r]==0) \
-               r++; \
-         }
-
       // Count unused rows ....
      
       // start on 4-byte boundary...
@@ -1206,7 +1018,10 @@ struct BlockDataInfo
       if (!rowMarked[r])
       #endif
       {
-         SKIP_ZEROS(r);
+         while(r<(IMMIX_LINES-4) && *(int *)(rowMarked+r)==0 )
+            r += 4;
+         while(r<(IMMIX_LINES) && rowMarked[r]==0)
+            r++;
       }
 
       if (r==IMMIX_LINES)
@@ -1288,7 +1103,10 @@ struct BlockDataInfo
                if (!rowMarked[r])
                #endif
                {
-                  SKIP_ZEROS(r);
+                  while(r<(IMMIX_LINES-4) && *(int *)(rowMarked+r)==0 )
+                     r += 4;
+                  while(r<(IMMIX_LINES) && rowMarked[r]==0)
+                     r++;
                }
                ranges[hole].length = r-start;
                hole++;
@@ -1779,8 +1597,6 @@ struct GlobalChunks
       processList = (volatile MarkChunk *)inChunk;
    }
 
-   bool hasWork() { return processList != 0; }
-
    void copyPointers( QuickVec<hx::Object *> &outPointers,bool andFree=false)
    {
       int size = 0;
@@ -1982,31 +1798,6 @@ struct GlobalChunks
       return alloc();
    }
 
-   void trim()
-   {
-      // Called during STW/serial phase
-      MarkChunk *head = (MarkChunk *)freeList;
-      int count = 0;
-      MarkChunk *prev = 0;
-      while(head)
-      {
-         if (count >= 256) 
-         {
-             MarkChunk *toDelete = head;
-             head = head->next;
-             delete toDelete;
-             if (prev) prev->next = head;
-             else freeList = head;
-         }
-         else
-         {
-             prev = head;
-             head = head->next;
-             count++;
-         }
-      }
-   }
-
 };
 
 GlobalChunks sGlobalChunks;
@@ -2026,7 +1817,6 @@ public:
     enum { StackSize = 8192 };
 
     bool isGenerational;
-    double mDeadline;
 
     MarkContext(int inThreadId = -1)
     {
@@ -2038,7 +1828,6 @@ public:
        marking = sGlobalChunks.alloc();
 
        isGenerational = false;
-       mDeadline = -1.0;
     }
     ~MarkContext()
     {
@@ -2132,35 +1921,17 @@ public:
        marking = 0;
     }
 
-    bool processMarkStackStep(double deadline)
+    void processMarkStack()
     {
-       mDeadline = deadline;
-       int checkCount = 0;
-       int checkInterval = sgMarkCheckInterval;
-
        while(true)
        {
-          if (deadline > 0.0 && ++checkCount > checkInterval)
-          {
-             checkCount = 0;
-             double now = __hxcpp_time_stamp();
-             if (now > deadline)
-                return false;
-             
-             // Dynamic interval: check more often as we approach the deadline
-             if (deadline - now < sgIncrementalBudget * 0.5)
-                 checkInterval = 8;
-             else
-                 checkInterval = sgMarkCheckInterval;
-          }
-
           if (!marking || !marking->count)
           {
              #ifdef HX_MULTI_THREAD_MARKING
              if (sgThreadPoolAbort)
              {
                 releaseJobs();
-                return true;
+                return;
              }
              #endif
 
@@ -2176,65 +1947,13 @@ public:
                 MarkObjectArray(elems, n, this);
                 continue;
              }
-             if (marking->count==MarkChunk::HASH_JOB)
-             {
-                 hx::HashRoot *hash = marking->hash;
-                 int bucket = marking->currentBucket;
-                 marking->count = 0;
-                 int next = hash->MarkStep(bucket, 256, this);
-                 if (next != -1)
-                 {
-                     MarkChunk *chunk = sGlobalChunks.alloc();
-                     chunk->count = MarkChunk::HASH_JOB;
-                     chunk->hash = hash;
-                     chunk->currentBucket = next;
-                     sGlobalChunks.pushJob(chunk, false);
-                 }
-                 continue;
-             }
           }
 
           while(marking)
           {
-             if (deadline > 0.0 && ++checkCount > checkInterval)
-             {
-                checkCount = 0;
-                double now = __hxcpp_time_stamp();
-                if (now > deadline)
-                   return false;
-
-                // Dynamic interval update inside hot loop
-                if (deadline - now < sgIncrementalBudget * 0.5)
-                   checkInterval = 8;
-                else
-                   checkInterval = sgMarkCheckInterval;
-             }
-
-             // Enhanced prefetching for better cache performance
-             if (marking->count >= 4) {
-                 // Prefetch pointers in stack
-                 HX_PREFETCH(marking->stack[marking->count-2]);
-                 HX_PREFETCH(marking->stack[marking->count-3]);
-                 
-                 // Prefetch object content for next iteration
-                 hx::Object *next = marking->stack[marking->count-1];
-                 if (next) {
-                    #if defined(__GNUC__) || defined(__clang__)
-                    __builtin_prefetch((void*)next);
-                    #else
-                    HX_PREFETCH(next);
-                    #endif
-                 }
-             }
-
              hx::Object *obj = marking->pop();
              if (obj)
              {
-                #if defined(__GNUC__) || defined(__clang__)
-                // Prefetch object header/vtable before virtual call
-                __builtin_prefetch((void*)obj);
-                #endif
-
                 obj->__Mark(this);
                 #ifdef HX_MULTI_THREAD_MARKING
                 // Load balance
@@ -2255,12 +1974,6 @@ public:
                 break;
           }
        }
-       return true;
-    }
-
-    void processMarkStack()
-    {
-       processMarkStackStep(-1.0);
     }
 };
 
@@ -2369,16 +2082,8 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 
          unsigned int *pos = info->allocStart + startRow;
          unsigned int val = *pos;
-         unsigned int mask = gImmixStartFlag[start&127];
-   // Use cached mask to avoid memory access
-   if ( !(val & mask) )
-   {
-      // Optimistic check first
-      if ( !(_hx_atomic_or((volatile int *)pos, (int)mask) & mask) )
-      {
-          // We set the bit, so we are the first one
-      }
-   }
+         while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
+            val = *pos;
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
@@ -2462,15 +2167,8 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 
       unsigned int *pos = info->allocStart + startRow;
       unsigned int val = *pos;
-      unsigned int mask = gImmixStartFlag[start&127];
-      if (!(val & mask))
-      {
-         // Optimistic check first
-         if ( !(_hx_atomic_or((volatile int *)pos, (int)mask) & mask) )
-         {
-             // We set the bit, so we are the first one
-         }
-      }
+      while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|gImmixStartFlag[start&127]) != val)
+         val = *pos;
       #ifdef HXCPP_GC_GENERATIONAL
       info->mHasSurvivor = true;
       #endif
@@ -2577,29 +2275,15 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
    if (sAllThreads && inLength>4096)
    {
       hx::Object **dishOffEnd = end - 4096;
-      int loopCount = 0;
       while(ptrI<end)
       {
          // Are the other threads slacking off?
-          if ((sRunningThreads != sAllThreads) && ptrI<dishOffEnd)
+         if ((sRunningThreads != sAllThreads) && ptrI<dishOffEnd)
          {
             ptrI += sGlobalChunks.takeArrayJob(ptrI, end-ptrI);
          }
          else
          {
-            if (ptrI + 32 < end) {
-               // Level 1: Prefetch pointers further ahead
-               HX_PREFETCH(ptrI + 16);
-               HX_PREFETCH(ptrI + 20);
-
-               // Level 2: Prefetch object headers (dereference pointers we hopefully just fetched)
-               // We look closer (e.g. +4 or +8) assuming ptrI[4] is already in cache
-               if (ptrI[4]) HX_PREFETCH(ptrI[4]);
-               if (ptrI[5]) HX_PREFETCH(ptrI[5]);
-               if (ptrI[6]) HX_PREFETCH(ptrI[6]);
-               if (ptrI[7]) HX_PREFETCH(ptrI[7]);
-            }
-
             MARK_PTR_I;
             MARK_PTR_I;
             MARK_PTR_I;
@@ -2625,49 +2309,8 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
    else
    #endif
    {
-      int loopCount = 0;
       while(ptrI<end)
       {
-         // 1. Check if we have enough elements to proceed with the unrolled loop (16 elements)
-         if (ptrI + 16 > end) {
-             // Not enough elements for a full batch. Process remaining elements individually.
-             while(ptrI < end) {
-                 MARK_PTR_I;
-             }
-             break; 
-         }
-
-         if (__inCtx->mDeadline > 0.0 && ++loopCount > 32)
-         {
-             loopCount = 0;
-             double now = __hxcpp_time_stamp();
-             if (now > __inCtx->mDeadline)
-             {
-                 int remaining = (int)(end - ptrI);
-                 if (remaining > 0)
-                 {
-                     MarkChunk *chunk = sGlobalChunks.alloc();
-                     chunk->count = MarkChunk::OBJ_ARRAY_JOB;
-                     chunk->arrayBase = ptrI;
-                     chunk->arrayElements = remaining;
-                     sGlobalChunks.pushJob(chunk, false);
-                 }
-                 return;
-             }
-         }
-         
-         if (ptrI + 32 < end) { // Safe prefetch distance
-            // Level 1: Prefetch pointers further ahead
-            HX_PREFETCH(ptrI + 16);
-            HX_PREFETCH(ptrI + 20);
-
-            // Level 2: Enhanced object header prefetching
-            if (ptrI[0]) HX_PREFETCH(ptrI[0]);
-            if (ptrI[4]) HX_PREFETCH(ptrI[4]);
-            if (ptrI[8]) HX_PREFETCH(ptrI[8]);
-            if (ptrI[12]) HX_PREFETCH(ptrI[12]);
-         }
-
          MARK_PTR_I;
          MARK_PTR_I;
          MARK_PTR_I;
@@ -2688,23 +2331,6 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
          MARK_PTR_I;
          MARK_PTR_I;
       }
-   }
-}
-
-void MarkHashAlloc(hx::HashRoot *hash, hx::MarkContext *__inCtx)
-{
-   if (hash->getSize() > 1024)
-   {
-       // Use job
-       MarkChunk *chunk = sGlobalChunks.alloc();
-       chunk->count = MarkChunk::HASH_JOB;
-       chunk->hash = hash;
-       chunk->currentBucket = 0;
-       sGlobalChunks.pushJob(chunk, false);
-   }
-   else
-   {
-       hash->MarkStep(0, 0x7fffffff, __inCtx);
    }
 }
 
@@ -2929,7 +2555,6 @@ bool IsWeakRefValid(const HX_CHAR *inPtr)
 
 bool IsWeakRefValid(hx::Object *inPtr)
 {
-   if (!inPtr) return false; // Safety check
    unsigned char mark = ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE];
 
     // Special case of member closure - check if the 'this' pointer is still alive
@@ -3001,8 +2626,8 @@ typedef hx::QuickVec< Finalizable > FinalizableList;
 FILE_SCOPE FinalizableList sFinalizableList;
 
 
-double tFinalizers;
-int finalizerCount;
+static double tFinalizers;
+static int finalizerCount;
 static int localCount;
 static int localObjects;
 static int localAllocs;
@@ -4009,16 +3634,15 @@ public:
 
          if (!result)
          {
-            // Try incremental step first
-            inAlloc->SetupStackAndCollect(false,forceCompact,true,true, false);
+            inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
             result = GetNextFree(inRequiredBytes);
          }
 
          if (!result && !forceCompact)
          {
-            // Try with compact this time... and URGENT (Preempt)
+            // Try with compact this time...
             forceCompact = true;
-            inAlloc->SetupStackAndCollect(false,forceCompact,true,true, true);
+            inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
             result = GetNextFree(inRequiredBytes);
          }
 
@@ -4349,15 +3973,7 @@ public:
          unsigned int *srcStart = from->allocStart;
 
          // Scan nursery for survivors
-      // Optimisation: skip survivor check on mobile unless critical
-      static int sSurvivorSkipCount = 0;
-      if (++sSurvivorSkipCount < 4) // Only do this expensive scan every 4th minor GC
-      {
-         continue;
-      }
-      sSurvivorSkipCount = 0;
-
-      for(int hole = 0; hole<from->mHoles; hole++)
+         for(int hole = 0; hole<from->mHoles; hole++)
          {
             int start = from->mRanges[hole].start;
             int len = from->mRanges[hole].length;
@@ -4486,9 +4102,6 @@ public:
 
    int releaseEmptyGroups(BlockDataStats &outStats, size_t releaseSize)
    {
-      // Cap release size to avoid massive stutters when returning memory to OS
-      if (releaseSize > 64*1024*1024) releaseSize = 64*1024*1024;
-
       int released=0;
       int groups=0;
       for(int i=0; i<mAllBlocks.size(); i++ )
@@ -4900,9 +4513,7 @@ public:
 
          if (sgThreadPoolJob==tpjMark)
          {
-            // Use global deadline and release unfinished jobs for other threads
-            context.processMarkStackStep(sgMarkDeadline);
-            context.releaseJobs();
+            context.processMarkStack();
          }
          else if (sgThreadPoolJob==tpjAsyncZeroJit)
          {
@@ -5092,7 +4703,7 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-   void MarkSetup(bool inGenerational)
+   void MarkAll(bool inGenerational)
    {
       if (!inGenerational)
       {
@@ -5197,28 +4808,18 @@ public:
       #endif
 
       MEM_STAMP(tMarkLocalEnd);
-   }
 
-   bool MarkStep(double deadline)
-   {
       #ifdef HX_MULTI_THREAD_MARKING
-         // Respect the deadline even with threads
-         sgMarkDeadline = deadline;
          mMarker.releaseJobs();
-         
-         // Start threads, wait for them to finish current batch or timeout
-         StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
-         
-         // If threads timed out, they pushed jobs back to GlobalChunks.
-          // If completed, GlobalChunks is empty.
-          return !hx::sGlobalChunks.hasWork();
-      #else
-         return mMarker.processMarkStackStep(deadline);
-      #endif
-   }
 
-   void MarkTeardown()
-   {
+         // Unleash the workers...
+         StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
+      #else
+         mMarker.processMarkStack();
+      #endif
+
+
+
       MEM_STAMP(tMarked);
 
       hx::FindZombies(mMarker);
@@ -5237,75 +4838,6 @@ public:
          GCLOG(" ******** is marked  : %d\n", (((unsigned char *)(*watch))[HX_ENDIAN_MARK_ID_BYTE]== gByteMarkID));
       }
       #endif
-   }
-
-   // Returns true if completed, false if yielded
-   bool MarkAllIncremental(bool inGenerational, double deadline)
-   {
-      if (!sgIncContext.active) {
-          // First time setup
-          sgIncContext.active = true;
-          sgIncContext.generational = inGenerational;
-          sgIncContext.startTime = __hxcpp_time_stamp();
-          MarkSetup(inGenerational);
-      }
-      
-      // Resume or continue marking
-      bool done = false;
-      
-      // Safepoint Checkpoint before starting the incremental step
-      if (!gSafepoint.Checkpoint())
-      {
-          // Rollback occurred!
-          // We assume state is reset to safe point.
-          // In real implementation, we might need to clean up partially marked objects or restart phase.
-          // For now, we just continue (retry).
-          GCLOG("Recovered from GC Safepoint Rollback. Resuming...\n");
-      }
-
-      while(true)
-      {
-         sgIncContext.steps++;
-         
-         // Use a small time slice for the check
-         if (MarkStep(deadline)) {
-             done = true;
-             break;
-         }
-         
-         // Verify consistency after each step
-         if (!gSafepoint.Verify())
-         {
-             gSafepoint.Rollback();
-         }
-
-         if (__hxcpp_time_stamp() > deadline) {
-             // Yield back to mutator
-             return false;
-         }
-      }
-      
-      if (done) {
-         #ifdef SHOW_MEM_EVENTS
-         double totalTime = (__hxcpp_time_stamp() - sgIncContext.startTime) * 1000.0;
-         GCLOG("[GC_REPORT] Mode: %s | Steps: %d | TotalTime: %.2fms\n", 
-               sgIncContext.generational ? "Minor" : "Full", 
-               sgIncContext.steps, 
-               totalTime);
-         #endif
-         
-         MarkTeardown();
-         // Don't reset context immediately if we have pending finalizers in a real incremental system
-         sgIncContext.reset();
-         return true;
-      }
-      
-      return false;
-   }
-
-   void MarkAll(bool inGenerational)
-   {
-      MarkAllIncremental(inGenerational, __hxcpp_time_stamp() + 1000.0);
    }
 
 
@@ -5333,17 +4865,9 @@ public:
    }
    #endif
 
-   void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged, bool inUrgent=false)
+   void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
    {
       PROFILE_COLLECT_SUMMARY_START;
-
-      // Priority Preemption: If urgent, increase budget significantly to ensure progress
-      // But limit to 3ms max as requested, to avoid stalling mutator too long
-      if (inUrgent) {
-          sgIncrementalBudget = 0.002; // 3ms max for urgent
-      } else {
-          sgIncrementalBudget = 0.001; // Reset to default 1ms
-      }
 
       #ifndef HXCPP_SINGLE_THREADED_APP
       // If we set the flag from 0 -> 0xffffffff then we are the collector
@@ -5418,116 +4942,43 @@ public:
             freeFraggedRows += mFreeBlocks[i]->GetFreeRows();
       }
 
-      size_t oldLargeAllocated = mLargeAllocated;
-
       // Now all threads have mTopOfStack & mBottomOfStack set.
       bool generational = false; 
 
       #ifdef HXCPP_GC_GENERATIONAL
       bool compactSurviors = false;
-      hx::QuickVec<hx::Object *> rememberedSet;
 
-      // Check if we are resuming an incremental collection
-      if (sgIncContext.active)
+      if (sGcMode==gcmGenerational)
       {
-         generational = sgIncContext.generational;
-         double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
-         
-         if (!MarkAllIncremental(generational, deadline))
+         for(int i=0;i<mLocalAllocs.size();i++)
          {
-             // Yield: Clean up thread locks and return
-             sgIsCollecting = false;
-             hx::gPauseForCollect = 0x00000000;
-             #ifndef HXCPP_SINGLE_THREADED_APP
-                for(int i=0;i<mLocalAllocs.size();i++)
-                {
-                   if (mLocalAllocs[i]!=this_local)
-                      ReleaseFromSafe(mLocalAllocs[i]);
-                }
-                if (!inLocked)
-                   gThreadStateChangeLock->Unlock();
-             #endif
-             return;
+            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+            if( ctx->mOldReferrers->count )
+                hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
+            else
+                hx::sGlobalChunks.free( ctx->mOldReferrers );
+            ctx->mOldReferrers = 0;
          }
       }
-      else
+
+      hx::QuickVec<hx::Object *> rememberedSet;
+      generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
+      if (sGcMode==gcmGenerational)
       {
-          if (sGcMode==gcmGenerational)
-          {
-             for(int i=0;i<mLocalAllocs.size();i++)
-             {
-                hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
-                if( ctx->mOldReferrers->count )
-                    hx::sGlobalChunks.addLocked( ctx->mOldReferrers );
-                else
-                    hx::sGlobalChunks.free( ctx->mOldReferrers );
-                ctx->mOldReferrers = 0;
-             }
-          }
-    
-          // Heuristic: If we haven't had a major GC in a while, force one
-          if (inMajor || inForceCompact || sGcMode != gcmGenerational)
-             sgMinorGCCount = 0;
-
-          generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
-          if (generational)
-          {
-             sgMinorGCCount++;
-             if (sgMinorGCCount > sgMinorGCMaxConsecutive)
-             {
-                sgMinorGCCount = 0;
-                generational = false;
-             }
-          }
-
-          if (sGcMode==gcmGenerational)
-          {
-             hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
-             #ifdef SHOW_MEM_EVENTS
-             GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
-             #endif
-             for(int i=0;i<rememberedSet.size();i++)
-                ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
-          }
-          
-          STAMP(t1)
-
-          // Start new collection
-      // Use dynamic budget for incremental marking
-      // Note: sgIncrementalBudget is the total time for the whole collection process, not just marking
-      double deadline = __hxcpp_time_stamp() + sgIncrementalBudget;
-      
-      
-      if (!MarkAllIncremental(generational, deadline)) 
-      {
-         // Yield: Clean up thread locks and return
-         sgIsCollecting = false;
-         hx::gPauseForCollect = 0x00000000;
-         #ifndef HXCPP_SINGLE_THREADED_APP
-            for(int i=0;i<mLocalAllocs.size();i++)
-            {
-               if (mLocalAllocs[i]!=this_local)
-                  ReleaseFromSafe(mLocalAllocs[i]);
-            }
-            if (!inLocked)
-               gThreadStateChangeLock->Unlock();
+         hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
          #endif
-         return;
+         for(int i=0;i<rememberedSet.size();i++)
+            ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
       }
-      
-      
-      if (__hxcpp_time_stamp() > deadline)
-      {
-          compactSurviors = false;
-      }
-      }
-      #else
-      // Non-generational fallback
-      MarkAll(false);
       #endif
 
+      STAMP(t1)
+
+      MarkAll(generational);
+
       #ifdef HX_GC_VERIFY_GENERATIONAL
-      if (!sgIncContext.active) // Only verify if fully completed
       {
          #ifdef SHOW_MEM_EVENTS
          GCLOG("verify generational [\n");
@@ -5544,6 +4995,11 @@ public:
 
       STAMP(t2)
 
+
+      // Sweep blocks
+
+      // Update table entries?  This needs to be done before the gMarkID count clocks
+      //  back to the same number
       if (!generational)
          sgTimeToNextTableUpdate--;
 
@@ -5552,57 +5008,56 @@ public:
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
       BlockDataStats stats;
-      
+
+      /*
+       This reduces the stall time, but adds a bit of background cpu usage
+       Might be good to just countRows for non-generational too
+      */
       if (!full && generational)
       {
-         // Fast path: Use cached stats to avoid O(N) countRows() scan
-         double filled = (double)(mRowsInUse)/(double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-         
-         // Only if we suspect high usage do we do the full check or fallback
-         if (filled > 0.85)
+         countRows(stats);
+         size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
+         double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
+         if (filled>0.85)
          {
-            countRows(stats);
-            size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
-            filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
-            
-            if (filled > 0.85)
-            {
-                // Fallback to Full GC logic...
-                // (Existing logic omitted for brevity, assumed handled by caller or next cycle)
-                // For now, in incremental mode, we prefer to finish the current minor cycle 
-                // and let the next cycle be Full if needed, to avoid stalling here.
-                
-                // If we really need to upgrade, we should have done it at the start.
-                // Late upgrade is costly.
-            }
+            // Failure of generational estimation
+            int retained = currentRows - mRowsInUse;
+            int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
+            if (space<retained)
+               space = retained;
+            if (space<1)
+               space = 1;
+            mGenerationalRetainEstimate = (double)retained/(double)space;
+            #ifdef SHOW_MEM_EVENTS
+            GCLOG("Generational retention/fragmentation too high %f, do normal collect\n", mGenerationalRetainEstimate);
+            #endif
+
+            #ifdef HX_GC_VERIFY_ALLOC_START
+            verifyAllocStart();
+            #endif
+
+            generational = false;
+            MarkAll(generational);
+
+            sgTimeToNextTableUpdate--;
+            full = sgTimeToNextTableUpdate<=0;
+
+            stats.clear();
+            reclaimBlocks(full,stats);
          }
       }
-      
-      reclaimBlocks(full,stats);
+      else
+      {
+         reclaimBlocks(full,stats);
+      }
 
 
       #ifdef HXCPP_GC_GENERATIONAL
-      // Remembered set is needed for compaction
-      hx::QuickVec<hx::Object *> &activeRS = sgIncContext.active ? sgIncContext.rememberedSet : rememberedSet;
-      
-      // Incremental Write Barrier Logic
-      // When we resume, any newly modified old->new references will be in the mOldReferrers
-      // of the thread contexts. We must scan them.
-      // Ideally, this should happen at the START of the Resume phase, not here at the end.
-      // But for correctness of compaction, we ensure we have the full set.
-      
       if (compactSurviors)
       {
-         MoveSurvivors(&activeRS);
+         MoveSurvivors(&rememberedSet);
       }
       #endif
-      
-      STAMP(tFinalizers)
-      if (hx::finalizerCount > 0)
-      {
-          hx::RunFinalizers();
-      }
-      hx::tFinalizers = __hxcpp_time_stamp();
 
 
       #ifdef HXCPP_GC_MOVING
@@ -5668,28 +5123,10 @@ public:
       // Manage recycle size ?
       //  clear old frames recycle objects
       int l2 = largeObjectRecycle.size();
-      
-      int maxFreesPerCycle = 50; // Tunable parameter
-      int freesCount = 0;
-      
-      while(largeObjectRecycle.size() > 0 && freesCount < maxFreesPerCycle)
-      {
-         unsigned int *blob = largeObjectRecycle.pop();
-         HxFree(blob);
-         freesCount++;
-      }
-      
-      if (inForceCompact || inUrgent)
-      {
-          // In urgent mode, free everything to reclaim memory immediately
-          while(largeObjectRecycle.size() > 0)
-          {
-             unsigned int *blob = largeObjectRecycle.pop();
-             HxFree(blob);
-          }
-      }
+      for(int i=0;i<largeObjectRecycle.size();i++)
+         HxFree(largeObjectRecycle[i]);
+      largeObjectRecycle.setSize(0);
 
-      // 2. Scan active large object list
       size_t recycleRemaining = 0;
       #ifdef RECYCLE_LARGE
       if (!inForceCompact)
@@ -5698,33 +5135,13 @@ public:
 
       int idx = 0;
       int l0 = mLargeList.size();
-      double sweepDeadline = __hxcpp_time_stamp() + (inUrgent ? 0.010 : 0.0005); // 0.5ms slice for sweep
-      size_t freedLargeBytes = 0;
-      const size_t maxLargeFreeBytes = 64 * 1024 * 1024; // Limit large object free per GC
-
       while(idx<mLargeList.size())
       {
-         // Check time budget periodically
-         if ((idx & 0xF) == 0 && __hxcpp_time_stamp() > sweepDeadline && !inUrgent)
-         {
-
-             break;
-         }
-
          unsigned int *blob = mLargeList[idx];
          if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
          {
             unsigned int size = *blob;
-            
-            // Incremental sweep: if we freed too much, defer the rest to next GC
-            if (freedLargeBytes > maxLargeFreeBytes)
-            {
-               idx++;
-               continue;
-            }
-
             mLargeAllocated -= size;
-            
             if (size < recycleRemaining)
             {
                recycleRemaining -= size;
@@ -5732,11 +5149,9 @@ public:
             }
             else
             {
-               // Direct free
                HxFree(blob);
-               freedLargeBytes += size;
             }
-            
+
             mLargeList.qerase(idx);
          }
          else
@@ -5752,10 +5167,7 @@ public:
 
       // Compact/Defrag?
       #if defined(HXCPP_GC_MOVING) && defined(HXCPP_VISIT_ALLOCS)
-      
-      bool skipCompaction = !inUrgent && (sgIncrementalBudget < 0.005);
-      
-      if (full && !skipCompaction)
+      if (full)
       {
          bool doRelease = false;
 
@@ -5866,14 +5278,6 @@ public:
       size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, (size_t)(baseMem * profileCollectSummary.spaceFactor ) );
       #else
       size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, baseMem/100 *hx::sgTargetFreeSpacePercentage );
-      
-      // Dynamic Scaling:
-      // Small heap (< 64MB) -> Aggressive growth (200% target) to improve throughput
-      if (baseMem < 64*1024*1024)
-         targetFree = std::max(targetFree, baseMem * 2);
-      // Large heap (> 512MB) -> Conservative growth (25% target) to reduce OOM risk and huge pauses
-      if (baseMem > 512*1024*1024)
-         targetFree = std::min(targetFree, baseMem / 4);
       #endif
       targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
       // Only adjust if non-generational
@@ -5896,7 +5300,7 @@ public:
       if (generational)
       {
          // TODO - include large too?
-         int retained = (int)(mRowsInUse - oldRowsInUse) + (int)((mLargeAllocated - oldLargeAllocated) >> IMMIX_LINE_BITS);
+         int retained = mRowsInUse - oldRowsInUse;
          int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - oldRowsInUse;
          if (space<retained)
             space = retained;
@@ -5912,30 +5316,13 @@ public:
       double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
       double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
 
-      // Adaptive GC Mode:
-      // If the estimated memory usage after a generational collection is still high (> 75%),
-      // or if we have done many generational collections in a row, force a full collection.
-      // The threshold 50 is now dynamic based on memory pressure.
-      
-      static int sGenCollectionCount = 0;
-      if (generational) sGenCollectionCount++;
-      else sGenCollectionCount = 0;
-
-      // Dynamic threshold: If we are close to full (filled_ratio high), trigger full GC sooner.
-      // Base threshold is 50, reduces to 10 as filled_ratio approaches 0.75
-      int dynamicThreshold = 50;
-      if (filled_ratio > 0.5) 
-          dynamicThreshold = 10 + (int)((0.75 - filled_ratio) * 40 / 0.25);
-      if (dynamicThreshold < 5) dynamicThreshold = 5;
-
-      if (after_gen < 0.75 && sGenCollectionCount < dynamicThreshold)
+      if (after_gen<0.75)
       {
          sGcMode = gcmGenerational;
       }
       else
       {
          sGcMode = gcmFull;
-         sGenCollectionCount = 0;
          // What was I thinking here?  This breaks #851
          //gByteMarkID |= 0x30;
       }
@@ -5951,7 +5338,7 @@ public:
 
       // This saves some running/stall time, but increases the total CPU usage
       // Delaying it until just before the block is used to improve the cache locality
-      backgroundProcessFreeList(false); // Move to background thread
+      backgroundProcessFreeList(true);
 
       mAllBlocksCount   = mAllBlocks.size();
       mCurrentRowsInUse = mRowsInUse;
@@ -5999,10 +5386,6 @@ public:
             ctx->mOldReferrers = hx::sGlobalChunks.alloc();
          }
       #endif
-      
-      // Cleanup incremental context on full completion
-      sgIncContext.reset();
-      hx::sGlobalChunks.trim();
 
 
       #ifdef HXCPP_GC_VERIFY
@@ -6819,7 +6202,7 @@ public:
    #endif // }  HXCPP_EXPLICIT_STACK_EXTENT
 
 
-   void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false, bool inUrgent=false)
+   void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false)
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
         #if HXCPP_DEBUG
@@ -6853,7 +6236,7 @@ public:
       #endif
 
 
-      sGlobalAlloc->Collect(inMajor, inForceCompact, inLocked, inFreeIsFragged, inUrgent);
+      sGlobalAlloc->Collect(inMajor, inForceCompact, inLocked, inFreeIsFragged);
    }
 
 

@@ -1,6 +1,3 @@
-#ifndef HX_HASH_H
-#define HX_HASH_H
-
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -273,8 +270,6 @@ struct HashRoot : public Object
     HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdHash };
 
    virtual void updateAfterGc() = 0;
-
-   virtual int MarkStep(int inStartBucket, int inCount, hx::MarkContext *__inCtx) { return -1; }
 
    inline int getSize() { return size; }
 };
@@ -638,18 +633,17 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
 
    template<typename F>
-   bool iterate(F &inFunc)
+   void iterate(F &inFunc)
    {
       for(int b=0;b<bucketCount;b++)
       {
          Element *el = bucket[b];
          while(el)
          {
-            if (!inFunc(el)) return false;
+            inFunc(el);
             el = el->next;
          }
       }
-      return true;
    }
 
    // Convert
@@ -660,10 +654,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
       Converter(NEW *inResult) : result(inResult) { }
 
-      bool operator()(typename Hash::Element *elem)
+      void operator()(typename Hash::Element *elem)
       {
          result->set(elem->key,elem->value);
-         return true;
       }
    };
 
@@ -693,10 +686,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       {
          array = Array<Key>(0,inReserve);
       }
-      bool operator()(typename Hash::Element *elem)
+      void operator()(typename Hash::Element *elem)
       {
          array->push(elem->key);
-         return true;
       }
    };
    Array<Key> keys()
@@ -716,10 +708,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
          array = Array<ArrayValue>(0,inReserve);
       }
 
-      bool operator()(typename Hash::Element *elem)
+      void operator()(typename Hash::Element *elem)
       {
          array->push(elem->value);
-         return true;
       }
    };
    Dynamic values()
@@ -748,14 +739,13 @@ struct Hash : public HashBase< typename ELEMENT::Key >
             #endif
          }
       }
-      bool operator()(typename Hash::Element *elem)
+      void operator()(typename Hash::Element *elem)
       {
          if (array->length>1)
             array->push(HX_CSTRING(", "));
          array->push(String(elem->key));
          array->push(HX_CSTRING(" => "));
          array->push(String(elem->value));
-         return true;
       }
       ::String toString()
       {
@@ -791,7 +781,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    {
       hx::MarkContext *__inCtx;
       HashMarker(hx::MarkContext *ctx) : __inCtx(ctx) { }
-      bool operator()(typename Hash::Element *inElem)
+      void operator()(typename Hash::Element *inElem)
       {
          HX_MARK_ARRAY(inElem);
          if (!Hash::Element::WeakKeys)
@@ -799,7 +789,6 @@ struct Hash : public HashBase< typename ELEMENT::Key >
             HX_MARK_MEMBER(inElem->key);
          }
          HX_MARK_MEMBER(inElem->value);
-         return true;
       }
    };
 
@@ -807,27 +796,8 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    {
       HX_MARK_ARRAY(bucket);
 
-      // HashMarker marker(__inCtx);
-      // // TODO: Make this interruptible properly
-      // iterate(marker);
-      hx::MarkHashAlloc(this, __inCtx);
-   }
-
-   int MarkStep(int inStartBucket, int inCount, hx::MarkContext *__inCtx)
-   {
-      int end = inStartBucket + inCount;
-      if (end > bucketCount) end = bucketCount;
-
       HashMarker marker(__inCtx);
-      for(int b=inStartBucket; b<end; b++)
-      {
-         Element *el = bucket[b];
-         while(el) {
-             marker(el);
-             el = el->next;
-         }
-      }
-      return end == bucketCount ? -1 : end;
+      iterate(marker);
    }
 
 #ifdef HXCPP_VISIT_ALLOCS
@@ -854,6 +824,4 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
 
 } // end namespace hx
-
-#endif
 
