@@ -54,6 +54,10 @@ enum { gAlwaysMove = false };
 #include <android/log.h>
 #endif
 
+#if defined(HX_LINUX) || defined(HX_ANDROID)
+#include <unistd.h>
+#endif
+
 #ifdef HX_WINDOWS
 #include <windows.h>
 #include <psapi.h>
