@@ -7,6 +7,12 @@
 #include "GcRegCapture.h"
 #include <hx/Unordered.h>
 
+#ifdef __APPLE__
+#include <mach/task.h>
+#include <mach/task_info.h>
+#include <mach/mach_init.h>
+#endif
+
 #ifdef EMSCRIPTEN
    #include <emscripten/stack.h>
    #ifdef HXCPP_SINGLE_THREADED_APP
