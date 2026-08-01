@@ -24,6 +24,16 @@
 #include <string>
 #include <stdlib.h>
 
+#if defined(_M_AMD64) || defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+   #include <emmintrin.h>
+   #define HXCPP_GC_USE_SSE2
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+   #include <arm_neon.h>
+   #define HXCPP_GC_USE_NEON
+#endif
+
 
 static bool sgIsCollecting = false;
 
@@ -948,6 +958,55 @@ struct BlockDataInfo
    void countRows(BlockDataStats &outStats)
    {
       unsigned char *rowMarked = mPtr->mRowMarked;
+      #ifdef HXCPP_GC_USE_SSE2
+      __m128i sum = _mm_setzero_si128();
+      __m128i zero = _mm_setzero_si128();
+      __m128i rows = _mm_loadu_si128((__m128i *)rowMarked);
+
+      #ifdef HXCPP_GC_BIG_BLOCKS
+      __m128i headerMask = _mm_setr_epi8(0, 0, 0, 0, -1, -1, -1, -1,
+                                        -1, -1, -1, -1, -1, -1, -1, -1);
+      #else
+      __m128i headerMask = _mm_setr_epi8(0, 0, -1, -1, -1, -1, -1, -1,
+                                        -1, -1, -1, -1, -1, -1, -1, -1);
+      #endif
+
+      rows = _mm_and_si128(rows, headerMask);
+      sum = _mm_add_epi64(sum, _mm_sad_epu8(rows, zero));
+      for(int i=16;i<IMMIX_LINES;i+=16)
+      {
+         rows = _mm_loadu_si128((__m128i *)(rowMarked+i));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(rows, zero));
+      }
+
+      sum = _mm_add_epi64(sum, _mm_unpackhi_epi64(sum, sum));
+      mUsedRows = _mm_cvtsi128_si32(sum);
+
+      #elif defined(HXCPP_GC_USE_NEON)
+      uint16x8_t sum = vdupq_n_u16(0);
+      uint8x16_t rows = vld1q_u8(rowMarked);
+
+      #ifdef HXCPP_GC_BIG_BLOCKS
+      static const uint8_t headerMaskBytes[16] =
+         { 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255 };
+      #else
+      static const uint8_t headerMaskBytes[16] =
+         { 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255 };
+      #endif
+
+      rows = vandq_u8(rows, vld1q_u8(headerMaskBytes));
+      sum = vpadalq_u8(sum, rows);
+      for(int i=16;i<IMMIX_LINES;i+=16)
+      {
+         rows = vld1q_u8(rowMarked+i);
+         sum = vpadalq_u8(sum, rows);
+      }
+
+      uint32x4_t sum32 = vpaddlq_u16(sum);
+      uint64x2_t sum64 = vpaddlq_u32(sum32);
+      mUsedRows = (int)(vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1));
+
+      #else
       unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
 
       // TODO - sse/neon
@@ -993,6 +1052,7 @@ struct BlockDataInfo
       #endif
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
+      #endif
       mUsedBytes = mUsedRows<<IMMIX_LINE_BITS;
 
       mZeroLock = 0;
@@ -1019,6 +1079,29 @@ struct BlockDataInfo
       int left = (IMMIX_USEFUL_LINES - mUsedRows) << IMMIX_LINE_BITS;
       if (left<mMaxHoleSize)
          mMaxHoleSize = left;
+   }
+
+   void countRowsIfNeeded(BlockDataStats &outStats)
+   {
+      bool changed = mOwned || mFraggedRows!=0;
+      #ifdef HXCPP_GC_GENERATIONAL
+      changed = changed || mHasSurvivor;
+      #endif
+
+      if (changed)
+      {
+         countRows(outStats);
+         return;
+      }
+
+      // An unowned block has not received nursery allocations since its
+      // cached occupancy was calculated. Preserve that occupancy without
+      // rereading every row. Reset the zero state exactly as countRows does,
+      // otherwise the next async-zero queue can inherit a stale completion.
+      outStats.rowsInUse += mUsedRows;
+      outStats.bytesInUse += mUsedBytes;
+      if (mZeroed==ZEROED_THREAD)
+         mZeroed = ZEROED_NOT;
    }
 
    template<bool FULL>
@@ -1944,7 +2027,7 @@ public:
        marking = 0;
     }
 
-    void processMarkStack()
+    void processMarkStack(bool inController = false)
     {
        while(true)
        {
@@ -1958,7 +2041,10 @@ public:
              }
              #endif
 
-             marking = sGlobalChunks.popJobOrFinish(marking,mThreadId);
+             // Worker contexts clear their running bit when the global queue is
+             // exhausted. The collector context is not represented by such a bit.
+             marking = inController ? sGlobalChunks.popJobLocked(marking) :
+                                      sGlobalChunks.popJobOrFinish(marking,mThreadId);
              if (!marking)
                 break;
 
@@ -2104,9 +2190,7 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
                                           gMarkID;
 
          unsigned int *pos = info->allocStart + startRow;
-         unsigned int val = *pos;
-         while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
-            val = *pos;
+         _hx_atomic_or((volatile int *)pos, gImmixStartFlag[start&127]);
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
@@ -2189,9 +2273,7 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
                                        gMarkID;
 
       unsigned int *pos = info->allocStart + startRow;
-      unsigned int val = *pos;
-      while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|gImmixStartFlag[start&127]) != val)
-         val = *pos;
+      _hx_atomic_or((volatile int *)pos, gImmixStartFlag[start&127]);
       #ifdef HXCPP_GC_GENERATIONAL
       info->mHasSurvivor = true;
       #endif
@@ -2961,8 +3043,10 @@ hx::Object *__hxcpp_weak_ref_get(Dynamic inRef)
 // --- GlobalAllocator -------------------------------------------------------
 
 typedef hx::QuickVec<BlockDataInfo *> BlockList;
+typedef hx::UnorderedSet<BlockData *> BlockSet;
 
 typedef hx::QuickVec<unsigned int *> LargeList;
+typedef hx::UnorderedSet<unsigned int *> LargeSet;
 
 enum MemType { memUnmanaged, memBlock, memLarge };
 
@@ -3247,6 +3331,7 @@ public:
          mLargeListLock.Lock();
          mLargeAllocated -= size;
          // Could somehow keep it in the list, but mark as recycled?
+         mLargeSet.erase((unsigned int *)inLarge);
          mLargeList.qerase_val(blob);
          // We could maybe free anyhow?
          if (!largeObjectRecycle.hasExtraCapacity(1))
@@ -3351,6 +3436,7 @@ public:
          mLargeListLock.Lock();
 
       mLargeList.push(result);
+      mLargeSet.insert(result+2);
       mLargeAllocated += inSize;
 
       if (do_lock)
@@ -3576,6 +3662,7 @@ public:
          BlockDataInfo *info = new BlockDataInfo(gid,block);
 
          mAllBlocks.push(info);
+         mAllBlockSet.insert(block);
          mFreeBlocks.push(info);
       }
       std::stable_sort(&mAllBlocks[0], &mAllBlocks[0] + mAllBlocks.size(), SortByBlockPtr );
@@ -4224,6 +4311,7 @@ public:
          {
             outStats.emptyBlocks--;
             released++;
+            mAllBlockSet.erase(mAllBlocks[i]->mPtr);
             mAllBlocks[i]->destroy();
             mAllBlocks.erase(i);
          }
@@ -4426,7 +4514,7 @@ public:
          if (blockId>=mAllBlocks.size())
             break;
 
-         mAllBlocks[blockId]->countRows(outStats);
+         mAllBlocks[blockId]->countRowsIfNeeded(outStats);
       }
    }
 
@@ -4688,7 +4776,8 @@ public:
    }
 
 
-   void StartThreadJobs(ThreadPoolJob inJob, int inWorkers, bool inWait, int inThreadLimit = -1)
+   void StartThreadJobs(ThreadPoolJob inJob, int inWorkers, bool inWait,
+                        int inThreadLimit = -1, bool inReserveController = false)
    {
       mThreadJobId = 0;
 
@@ -4712,6 +4801,8 @@ public:
       {
          unsigned int hw = std::thread::hardware_concurrency();
          unsigned int cap = hw ? std::min((unsigned int)MAX_GC_THREADS, hw) : (unsigned int)MAX_GC_THREADS;
+         if (inReserveController && cap>1)
+            cap--;
          if (inThreadLimit < 0)
             sgThreadCount = (int)cap;
          else
@@ -4886,8 +4977,12 @@ public:
       #ifdef HX_MULTI_THREAD_MARKING
          mMarker.releaseJobs();
 
-         // Unleash the workers...
-         StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
+         // Let the stopped mutator/collector thread do useful work too. One
+         // hardware slot is reserved for it so the marking phase does not
+         // oversubscribe the machine.
+         StartThreadJobs(tpjMark, MAX_GC_THREADS, false, -1, true);
+         mMarker.processMarkStack(true);
+         StopThreadJobs(false);
       #else
          mMarker.processMarkStack();
       #endif
@@ -5235,6 +5330,7 @@ public:
          {
             unsigned int size = *blob;
             mLargeAllocated -= size;
+            mLargeSet.erase(blob+2);
             if (size < recycleRemaining)
             {
                recycleRemaining -= size;
@@ -5564,16 +5660,18 @@ public:
       {
          for(int i=0;i<MAX_GC_THREADS;i++)
             sThreadBlockDataStats[i].clear();
-         StartThreadJobs(tpjCountRows, mAllBlocks.size(), true);
-         outStats = sThreadBlockDataStats[0];
-         for(int i=1;i<MAX_GC_THREADS;i++)
+         outStats.clear();
+         StartThreadJobs(tpjCountRows, mAllBlocks.size(), false, -1, true);
+         CountAsync(outStats);
+         StopThreadJobs(false);
+         for(int i=0;i<MAX_GC_THREADS;i++)
             outStats.add(sThreadBlockDataStats[i]);
       }
       else
       {
          outStats.clear();
          for(int i=0;i<mAllBlocks.size();i++)
-            mAllBlocks[i]->countRows(outStats);
+            mAllBlocks[i]->countRowsIfNeeded(outStats);
       }
    }
 
@@ -5581,7 +5679,38 @@ public:
    // buils mFreeBlocks and maybe starts the async-zero process on mZeroList
    void createFreeList()
    {
+      int holeCounts[IMMIX_LINES+1] = { 0 };
+      int freeCount = 0;
+
+      for(int i=0;i<mAllBlocks.size();i++)
+      {
+         BlockDataInfo *info = mAllBlocks[i];
+         if (info->GetFreeRows() > 0 && info->mMaxHoleSize>256)
+         {
+            int holeRows = info->mMaxHoleSize >> IMMIX_LINE_BITS;
+            if (holeRows>IMMIX_LINES)
+               holeRows = IMMIX_LINES;
+            holeCounts[holeRows]++;
+            freeCount++;
+         }
+      }
+
       mFreeBlocks.clear();
+      int extra = std::max( mAllBlocks.size(), 8<<IMMIX_BLOCK_GROUP_BITS);
+      mFreeBlocks.safeReserveExtra(extra);
+      mFreeBlocks.setSize(freeCount);
+
+      // Exact row-count buckets preserve the old smallest-hole-first order
+      // without paying for an O(blocks log blocks) comparison sort.
+      int holeOffsets[IMMIX_LINES+1];
+      int holeWrite[IMMIX_LINES+1];
+      int offset = 0;
+      for(int i=0;i<=IMMIX_LINES;i++)
+      {
+         holeOffsets[i] = offset;
+         holeWrite[i] = offset;
+         offset += holeCounts[i];
+      }
 
       for(int i=0;i<mAllBlocks.size();i++)
       {
@@ -5589,29 +5718,25 @@ public:
          if (info->GetFreeRows() > 0 && info->mMaxHoleSize>256)
          {
             info->mOwned = false;
-            mFreeBlocks.push(info);
+            int holeRows = info->mMaxHoleSize >> IMMIX_LINE_BITS;
+            if (holeRows>IMMIX_LINES)
+               holeRows = IMMIX_LINES;
+            mFreeBlocks[holeWrite[holeRows]++] = info;
          }
       }
 
-      int extra = std::max( mAllBlocks.size(), 8<<IMMIX_BLOCK_GROUP_BITS);
-      mFreeBlocks.safeReserveExtra(extra);
-
-      std::sort(&mFreeBlocks[0], &mFreeBlocks[0] + mFreeBlocks.size(), SmallestFreeFirst );
-
-      for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
-         mNextFreeBlockOfSize[i] = mFreeBlocks.size();
-
-      for(int i=mFreeBlocks.size()-1;i>=0;i--)
+      int firstFree = freeCount;
+      for(int holeRows=IMMIX_LINES;holeRows>=0;holeRows--)
       {
-         int slot = mFreeBlocks[i]->mMaxHoleSize >> IMMIX_LINE_BITS;
-         if (slot>=BLOCK_OFSIZE_COUNT)
-            slot = BLOCK_OFSIZE_COUNT-1;
-         mNextFreeBlockOfSize[slot] = i;
+         if (holeCounts[holeRows])
+            firstFree = holeOffsets[holeRows];
+         if (holeRows<BLOCK_OFSIZE_COUNT)
+            mNextFreeBlockOfSize[holeRows] = firstFree;
       }
 
-      for(int i=BLOCK_OFSIZE_COUNT-2;i>=0;i--)
-         if (mNextFreeBlockOfSize[i]>mNextFreeBlockOfSize[i+1])
-            mNextFreeBlockOfSize[i] = mNextFreeBlockOfSize[i+1];
+      for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
+         if (mNextFreeBlockOfSize[i]>freeCount)
+            mNextFreeBlockOfSize[i] = freeCount;
 
       mZeroList.clear();
    }
@@ -5664,26 +5789,13 @@ public:
    {
       if (mAllBlocks.size())
       {
-         int min = 0;
          int max = mAllBlocks.size()-1;
          if (block==mAllBlocks[0]->mPtr)
             return true;
          if (block==mAllBlocks[max]->mPtr)
             return true;
          if (block>mAllBlocks[0]->mPtr && block<mAllBlocks[max]->mPtr)
-         {
-            while(min<max-1)
-            {
-               int mid = (max+min)>>1;
-               if (mAllBlocks[mid]->mPtr==block)
-                  return true;
-
-               if (mAllBlocks[mid]->mPtr<block)
-                  min = mid;
-               else
-                  max = mid;
-            }
-         }
+            return mAllBlockSet.find(block) != mAllBlockSet.end();
       }
       return false;
    }
@@ -5708,12 +5820,8 @@ public:
       if (isBlock)
          return memBlock;
 
-      for(int i=0;i<mLargeList.size();i++)
-      {
-         unsigned int *blob = mLargeList[i] + 2;
-         if (blob==inPtr)
-            return memLarge;
-      }
+      if (mLargeSet.find((unsigned int *)inPtr) != mLargeSet.end())
+         return memLarge;
 
       return memUnmanaged;
    }
@@ -5734,11 +5842,13 @@ public:
    volatile int mThreadJobId;
 
    BlockList mAllBlocks;
+   BlockSet  mAllBlockSet;
    BlockList mFreeBlocks;
    BlockList mZeroList;
    volatile int mZeroListQueue;
 
    LargeList mLargeList;
+   LargeSet  mLargeSet;
    HxMutex    mLargeListLock;
    hx::QuickVec<LocalAllocator *> mLocalAllocs;
    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
