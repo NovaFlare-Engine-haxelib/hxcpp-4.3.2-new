@@ -106,6 +106,19 @@ void DebuggerTrap()
 
 static bool sgAllocInit = 0;
 static bool sgInternalEnable = true;
+// Rhythm gameplay needs bounded pauses more than it needs the smallest heap.
+// This mode is entered only after a full safe-point collection has prepared a
+// reserve. Ordinary full requests and nursery-to-full fallback are deferred;
+// a compacting full collection remains as the allocation-failure safety valve.
+static volatile int sgGameplayGcMode = 0;
+static volatile int sgGameplayGcPreparing = 0;
+static size_t sgGameplayGcReserveBytes = 0;
+static size_t sgGameplayGcMaxHeadroomBytes = 0;
+static size_t sgGameplayGcMaxWorkingMemory = 0;
+static volatile int sgGameplayGcDeferredFulls = 0;
+static volatile int sgGameplayGcEmergencyFulls = 0;
+static double sgLastGcPauseMs = 0.0;
+static double sgGameplayGcMaxPauseMs = 0.0;
 static void *sgObject_root = 0;
 // With virtual inheritance, stack pointers can point to the middle of an object
 #ifdef _MSC_VER
@@ -3589,6 +3602,41 @@ public:
       return true;
    }
 
+   void reserveGameplayHeap()
+   {
+      size_t usedBytes = mRowsInUse << IMMIX_LINE_BITS;
+      size_t reserveBytes = sgGameplayGcReserveBytes;
+      size_t maxHeadroomBytes = std::max(reserveBytes, sgGameplayGcMaxHeadroomBytes);
+      size_t targetBytes = usedBytes + reserveBytes;
+      size_t maxBytes = usedBytes + maxHeadroomBytes;
+
+      if (targetBytes < usedBytes)
+         targetBytes = (size_t)-1;
+      if (maxBytes < usedBytes)
+         maxBytes = (size_t)-1;
+
+      sWorkingMemorySize = std::max(sWorkingMemorySize, targetBytes);
+      while(GetWorkingMemory() < targetBytes)
+      {
+         bool forceCompact = false;
+         if (!AllocMoreBlocks(forceCompact, false))
+            break;
+      }
+
+      sgGameplayGcMaxWorkingMemory = std::max(GetWorkingMemory(), maxBytes);
+
+      int blockSize = mAllBlocks.size() << IMMIX_BLOCK_BITS;
+      if (blockSize > mLargeAllocSpace)
+         mLargeAllocSpace = blockSize;
+      mLargeAllocForceRefresh = mLargeAllocated + mLargeAllocSpace;
+   }
+
+   bool canGrowGameplayHeap()
+   {
+      return sgGameplayGcMode && sgGameplayGcMaxWorkingMemory &&
+             GetWorkingMemory() < sgGameplayGcMaxWorkingMemory;
+   }
+
    bool allowMoreBlocks()
    {
       #ifdef HXCPP_GC_GENERATIONAL
@@ -3648,11 +3696,27 @@ public:
             result = GetNextFree(inRequiredBytes);
          }
 
-         if (!result && !forceCompact)
+         if (!result && canGrowGameplayHeap())
+         {
+            if (AllocMoreBlocks(forceCompact,false))
+               result = GetNextFree(inRequiredBytes);
+         }
+
+         if (!result && !forceCompact && !sgGameplayGcMode)
          {
             // Try with compact this time...
             forceCompact = true;
             inAlloc->SetupStackAndCollect(false,forceCompact,true,true);
+            result = GetNextFree(inRequiredBytes);
+         }
+
+         if (!result && sgGameplayGcMode)
+         {
+            // The prepared reserve and bounded growth allowance are exhausted.
+            // This is the only path that may run a long collection in gameplay.
+            _hx_atomic_add(&sgGameplayGcEmergencyFulls, 1);
+            forceCompact = true;
+            inAlloc->SetupStackAndCollect(true,forceCompact,true,true);
             result = GetNextFree(inRequiredBytes);
          }
 
@@ -4877,6 +4941,14 @@ public:
 
    void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
    {
+      double gameplayPauseStart = __hxcpp_time_stamp();
+      bool protectGameplayPause = sgGameplayGcMode && !sgGameplayGcPreparing;
+      if (protectGameplayPause && inMajor && !inForceCompact)
+      {
+         inMajor = false;
+         _hx_atomic_add(&sgGameplayGcDeferredFulls, 1);
+      }
+
       PROFILE_COLLECT_SUMMARY_START;
 
       #ifndef HXCPP_SINGLE_THREADED_APP
@@ -5038,6 +5110,16 @@ public:
             if (space<1)
                space = 1;
             mGenerationalRetainEstimate = (double)retained/(double)space;
+
+            if (protectGameplayPause)
+            {
+               // Do not turn one nursery pause into a second, full-heap mark
+               // while timing-sensitive gameplay is active. If the nursery
+               // cannot provide a block, GetFreeBlock grows the prepared heap.
+               _hx_atomic_add(&sgGameplayGcDeferredFulls, 1);
+            }
+            else
+            {
             #ifdef SHOW_MEM_EVENTS
             GCLOG("Generational retention/fragmentation too high %f, do normal collect\n", mGenerationalRetainEstimate);
             #endif
@@ -5054,6 +5136,7 @@ public:
 
             stats.clear();
             reclaimBlocks(full,stats);
+            }
          }
       }
       else
@@ -5326,7 +5409,11 @@ public:
       double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
       double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
 
-      if (after_gen<0.75)
+      if (sgGameplayGcMode)
+      {
+         sGcMode = gcmGenerational;
+      }
+      else if (after_gen<0.75)
       {
          sGcMode = gcmGenerational;
       }
@@ -5343,6 +5430,9 @@ public:
       #endif
 
       #endif
+
+      if (sgGameplayGcPreparing)
+         reserveGameplayHeap();
 
       createFreeList();
 
@@ -5414,6 +5504,10 @@ public:
       #endif
 
       sgIsCollecting = false;
+
+      sgLastGcPauseMs = (__hxcpp_time_stamp() - gameplayPauseStart) * 1000.0;
+      if (protectGameplayPause && sgLastGcPauseMs > sgGameplayGcMaxPauseMs)
+         sgGameplayGcMaxPauseMs = sgLastGcPauseMs;
 
 
       hx::gPauseForCollect = 0x00000000;
@@ -6961,6 +7055,67 @@ public:
 
 
 } // end namespace hx
+
+
+void __hxcpp_gc_enter_gameplay(int inReserveBytes, int inMaxHeadroomBytes)
+{
+   if (!sgAllocInit)
+      return;
+
+   if (inReserveBytes < 0)
+      inReserveBytes = 0;
+   if (inMaxHeadroomBytes < inReserveBytes)
+      inMaxHeadroomBytes = inReserveBytes;
+
+   sgGameplayGcReserveBytes = (size_t)inReserveBytes;
+   sgGameplayGcMaxHeadroomBytes = (size_t)inMaxHeadroomBytes;
+   sgGameplayGcMaxWorkingMemory = 0;
+   sgGameplayGcDeferredFulls = 0;
+   sgGameplayGcEmergencyFulls = 0;
+   sgGameplayGcMaxPauseMs = 0.0;
+
+   sgGameplayGcPreparing = 1;
+   sgGameplayGcMode = 1;
+   hx::InternalEnableGC(true);
+   hx::InternalCollect(true, false);
+   sgGameplayGcPreparing = 0;
+}
+
+void __hxcpp_gc_leave_gameplay(bool inCollectNow)
+{
+   bool wasActive = sgGameplayGcMode != 0;
+   sgGameplayGcPreparing = 0;
+   sgGameplayGcMode = 0;
+   sgGameplayGcMaxWorkingMemory = 0;
+
+   if (wasActive && inCollectNow && sgAllocInit)
+      hx::InternalCollect(true, false);
+}
+
+double __hxcpp_gc_last_pause_ms()
+{
+   return sgLastGcPauseMs;
+}
+
+double __hxcpp_gc_gameplay_max_pause_ms()
+{
+   return sgGameplayGcMaxPauseMs;
+}
+
+int __hxcpp_gc_gameplay_deferred_full_count()
+{
+   return sgGameplayGcDeferredFulls;
+}
+
+int __hxcpp_gc_gameplay_emergency_full_count()
+{
+   return sgGameplayGcEmergencyFulls;
+}
+
+bool __hxcpp_gc_is_gameplay_mode()
+{
+   return sgGameplayGcMode != 0;
+}
 
 
 Dynamic _hx_gc_freeze(Dynamic inObject)
