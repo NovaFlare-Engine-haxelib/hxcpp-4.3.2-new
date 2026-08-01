@@ -129,53 +129,6 @@ static volatile int sgGameplayGcDeferredFulls = 0;
 static volatile int sgGameplayGcEmergencyFulls = 0;
 static double sgLastGcPauseMs = 0.0;
 static double sgGameplayGcMaxPauseMs = 0.0;
-
-// Fixed-capacity, allocation-free GC pause telemetry. Collection only writes
-// one already-reserved record. Percentiles are calculated by the read API at
-// an engine safe point, never on the collector path.
-enum GcTelemetryMetric
-{
-   gctTotal = 0,
-   gctSetup,
-   gctRootsAndStatics,
-   gctThreadStacks,
-   gctTransitiveMark,
-   gctFinalizersAndWeak,
-   gctReclaim,
-   gctLargeSweep,
-   gctFreeListTail,
-   gctMetricCount,
-};
-
-enum GcTelemetryFlags
-{
-   gctFlagGenerational = 0x01,
-   gctFlagFull         = 0x02,
-   gctFlagCompact      = 0x04,
-   gctFlagGameplay     = 0x08,
-};
-
-enum { GC_TELEMETRY_CAPACITY = 512 };
-
-struct GcTelemetryRecord
-{
-   double value[gctMetricCount];
-   unsigned int flags;
-};
-
-static GcTelemetryRecord sgGcTelemetryRecords[GC_TELEMETRY_CAPACITY];
-static volatile unsigned int sgGcTelemetryWritten = 0;
-
-static inline void RecordGcTelemetry(const GcTelemetryRecord &inRecord)
-{
-   unsigned int written = sgGcTelemetryWritten;
-   GcTelemetryRecord &record = sgGcTelemetryRecords[written % GC_TELEMETRY_CAPACITY];
-   for(int metric=0; metric<gctMetricCount; metric++)
-      record.value[metric] = inRecord.value[metric];
-   record.flags = inRecord.flags;
-   sgGcTelemetryWritten = written + 1;
-}
-
 static void *sgObject_root = 0;
 // With virtual inheritance, stack pointers can point to the middle of an object
 #ifdef _MSC_VER
@@ -1695,17 +1648,6 @@ struct GlobalChunks
       }
 
       return alloc();
-   }
-
-   // Called by the stopped collector before workers are started. A capped
-   // count is enough to distinguish a small root queue from a large one.
-   int pendingJobCount(int inLimit) const
-   {
-      int count = 0;
-      for(MarkChunk *chunk=(MarkChunk *)processList;
-          chunk && count<inLimit; chunk=chunk->next)
-         count++;
-      return count;
    }
 
    MarkChunk *pushJob(MarkChunk *inChunk,bool inAndAlloc)
@@ -4926,9 +4868,8 @@ public:
    double tMarkLocal;
    double tMarkLocalEnd;
    double tMarked;
-   void MarkAll(bool inGenerational, GcTelemetryRecord &ioTelemetry)
+   void MarkAll(bool inGenerational)
    {
-      double telemetryPhaseStart = __hxcpp_time_stamp();
       if (!inGenerational)
       {
          hx::gPrevByteMarkID = hx::gByteMarkID;
@@ -4968,10 +4909,6 @@ public:
          #endif
          ClearBlockMarks();
       }
-
-      ioTelemetry.value[gctSetup] +=
-         (__hxcpp_time_stamp() - telemetryPhaseStart) * 1000.0;
-      telemetryPhaseStart = __hxcpp_time_stamp();
 
       MEM_STAMP(tMarkInit);
 
@@ -5021,10 +4958,6 @@ public:
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
       } // automark
 
-      ioTelemetry.value[gctRootsAndStatics] +=
-         (__hxcpp_time_stamp() - telemetryPhaseStart) * 1000.0;
-      telemetryPhaseStart = __hxcpp_time_stamp();
-
       MEM_STAMP(tMarkLocal);
       hx::localCount = 0;
 
@@ -5039,30 +4972,20 @@ public:
       hx::localAllocs = sAllocMarks;
       #endif
 
-      ioTelemetry.value[gctThreadStacks] +=
-         (__hxcpp_time_stamp() - telemetryPhaseStart) * 1000.0;
-      telemetryPhaseStart = __hxcpp_time_stamp();
-
       MEM_STAMP(tMarkLocalEnd);
 
       #ifdef HX_MULTI_THREAD_MARKING
          mMarker.releaseJobs();
 
-         // Start small, then let pushJob wake sleeping workers as the global
-         // queue grows. The controller participates and is not counted here.
-         // Eight is also the maximum covered by the lazy wake path.
-         int pendingMarkJobs = hx::sGlobalChunks.pendingJobCount(5);
-         int initialMarkWorkers = pendingMarkJobs>4 ? 4 : 2;
-         StartThreadJobs(tpjMark, initialMarkWorkers, false, 8, true);
+         // Let the stopped mutator/collector thread do useful work too. One
+         // hardware slot is reserved for it so the marking phase does not
+         // oversubscribe the machine.
+         StartThreadJobs(tpjMark, MAX_GC_THREADS, false, -1, true);
          mMarker.processMarkStack(true);
          StopThreadJobs(false);
       #else
          mMarker.processMarkStack();
       #endif
-
-      ioTelemetry.value[gctTransitiveMark] +=
-         (__hxcpp_time_stamp() - telemetryPhaseStart) * 1000.0;
-      telemetryPhaseStart = __hxcpp_time_stamp();
 
 
 
@@ -5071,9 +4994,6 @@ public:
       hx::FindZombies(mMarker);
 
       hx::RunFinalizers();
-
-      ioTelemetry.value[gctFinalizersAndWeak] +=
-         (__hxcpp_time_stamp() - telemetryPhaseStart) * 1000.0;
 
       #ifdef HXCPP_GC_VERIFY
       for(int i=0;i<mAllBlocks.size();i++)
@@ -5117,7 +5037,6 @@ public:
    void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
    {
       double gameplayPauseStart = __hxcpp_time_stamp();
-      GcTelemetryRecord telemetryRecord = {};
       bool protectGameplayPause = sgGameplayGcMode && !sgGameplayGcPreparing;
       if (protectGameplayPause && inMajor && !inForceCompact)
       {
@@ -5234,10 +5153,7 @@ public:
 
       STAMP(t1)
 
-      telemetryRecord.value[gctSetup] +=
-         (__hxcpp_time_stamp() - gameplayPauseStart) * 1000.0;
-
-      MarkAll(generational, telemetryRecord);
+      MarkAll(generational);
 
       #ifdef HX_GC_VERIFY_GENERATIONAL
       {
@@ -5246,7 +5162,7 @@ public:
          #endif
          sGcVerifyGenerational = true;
          sgTimeToNextTableUpdate--;
-         MarkAll(false, telemetryRecord);
+         MarkAll(false);
          sGcVerifyGenerational = false;
          #ifdef SHOW_MEM_EVENTS
          GCLOG("] verify generational\n");
@@ -5276,10 +5192,7 @@ public:
       */
       if (!full && generational)
       {
-         double telemetryReclaimStart = __hxcpp_time_stamp();
          countRows(stats);
-         telemetryRecord.value[gctReclaim] +=
-            (__hxcpp_time_stamp() - telemetryReclaimStart) * 1000.0;
          size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
          double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
          if (filled>0.85)
@@ -5311,35 +5224,26 @@ public:
             #endif
 
             generational = false;
-            MarkAll(generational, telemetryRecord);
+            MarkAll(generational);
 
             sgTimeToNextTableUpdate--;
             full = sgTimeToNextTableUpdate<=0;
 
             stats.clear();
-            telemetryReclaimStart = __hxcpp_time_stamp();
             reclaimBlocks(full,stats);
-            telemetryRecord.value[gctReclaim] +=
-               (__hxcpp_time_stamp() - telemetryReclaimStart) * 1000.0;
             }
          }
       }
       else
       {
-         double telemetryReclaimStart = __hxcpp_time_stamp();
          reclaimBlocks(full,stats);
-         telemetryRecord.value[gctReclaim] +=
-            (__hxcpp_time_stamp() - telemetryReclaimStart) * 1000.0;
       }
 
 
       #ifdef HXCPP_GC_GENERATIONAL
       if (compactSurviors)
       {
-         double telemetryReclaimStart = __hxcpp_time_stamp();
          MoveSurvivors(&rememberedSet);
-         telemetryRecord.value[gctReclaim] +=
-            (__hxcpp_time_stamp() - telemetryReclaimStart) * 1000.0;
       }
       #endif
 
@@ -5359,10 +5263,7 @@ public:
             #endif
             full = true;
             stats.clear();
-            double telemetryReclaimStart = __hxcpp_time_stamp();
             reclaimBlocks(full,stats);
-            telemetryRecord.value[gctReclaim] +=
-               (__hxcpp_time_stamp() - telemetryReclaimStart) * 1000.0;
          }
       }
       #endif
@@ -5409,7 +5310,6 @@ public:
 
       // Manage recycle size ?
       //  clear old frames recycle objects
-      double telemetryLargeStart = __hxcpp_time_stamp();
       int l2 = largeObjectRecycle.size();
       for(int i=0;i<largeObjectRecycle.size();i++)
          HxFree(largeObjectRecycle[i]);
@@ -5448,10 +5348,6 @@ public:
       }
 
       int l1 = mLargeList.size();
-
-      telemetryRecord.value[gctLargeSweep] +=
-         (__hxcpp_time_stamp() - telemetryLargeStart) * 1000.0;
-      double telemetryTailStart = __hxcpp_time_stamp();
 
 
       STAMP(t4)
@@ -5703,21 +5599,9 @@ public:
       __hxt_gc_end();
       #endif
 
-      double telemetryEnd = __hxcpp_time_stamp();
-      telemetryRecord.value[gctFreeListTail] +=
-         (telemetryEnd - telemetryTailStart) * 1000.0;
-      telemetryRecord.value[gctTotal] =
-         (telemetryEnd - gameplayPauseStart) * 1000.0;
-      telemetryRecord.flags = generational ? gctFlagGenerational : gctFlagFull;
-      if (inForceCompact)
-         telemetryRecord.flags |= gctFlagCompact;
-      if (protectGameplayPause)
-         telemetryRecord.flags |= gctFlagGameplay;
-      RecordGcTelemetry(telemetryRecord);
-
       sgIsCollecting = false;
 
-      sgLastGcPauseMs = telemetryRecord.value[gctTotal];
+      sgLastGcPauseMs = (__hxcpp_time_stamp() - gameplayPauseStart) * 1000.0;
       if (protectGameplayPause && sgLastGcPauseMs > sgGameplayGcMaxPauseMs)
          sgGameplayGcMaxPauseMs = sgLastGcPauseMs;
 
@@ -5777,15 +5661,7 @@ public:
          for(int i=0;i<MAX_GC_THREADS;i++)
             sThreadBlockDataStats[i].clear();
          outStats.clear();
-
-         // Small heaps are faster on the stopped controller alone. Scale the
-         // initial workers with block work, but never oversubscribe beyond the
-         // same eight-worker ceiling used by marking.
-         int blockCount = mAllBlocks.size();
-         int countWorkers = blockCount<96 ? 0 :
-                            blockCount<384 ? 2 :
-                            blockCount<1536 ? 4 : 8;
-         StartThreadJobs(tpjCountRows, countWorkers, false, 8, true);
+         StartThreadJobs(tpjCountRows, mAllBlocks.size(), false, -1, true);
          CountAsync(outStats);
          StopThreadJobs(false);
          for(int i=0;i<MAX_GC_THREADS;i++)
@@ -7349,106 +7225,6 @@ int __hxcpp_gc_gameplay_emergency_full_count()
 bool __hxcpp_gc_is_gameplay_mode()
 {
    return sgGameplayGcMode != 0;
-}
-
-int __hxcpp_gc_telemetry_metric_count()
-{
-   return gctMetricCount;
-}
-
-int __hxcpp_gc_telemetry_sample_count(int inRequiredFlags)
-{
-   // Read/reset APIs are intended for an engine safe point, outside Collect.
-   unsigned int written = sgGcTelemetryWritten;
-   unsigned int available = written<GC_TELEMETRY_CAPACITY ?
-                            written : GC_TELEMETRY_CAPACITY;
-   unsigned int first = written - available;
-   int count = 0;
-   for(unsigned int sample=0; sample<available; sample++)
-   {
-      const GcTelemetryRecord &record =
-         sgGcTelemetryRecords[(first + sample) % GC_TELEMETRY_CAPACITY];
-      if ( (record.flags & inRequiredFlags) == (unsigned int)inRequiredFlags )
-         count++;
-   }
-   return count;
-}
-
-double __hxcpp_gc_telemetry_read(int inMetric, int inStatistic,
-                                 int inRequiredFlags)
-{
-   // Statistics: 0=count, 1=P50, 2=P99, 3=P99.9, 4=max, 5=last.
-   if (inMetric<0 || inMetric>=gctMetricCount ||
-       inStatistic<0 || inStatistic>5)
-      return 0.0;
-
-   unsigned int written = sgGcTelemetryWritten;
-   unsigned int available = written<GC_TELEMETRY_CAPACITY ?
-                            written : GC_TELEMETRY_CAPACITY;
-   unsigned int first = written - available;
-   double values[GC_TELEMETRY_CAPACITY];
-   int count = 0;
-
-   for(unsigned int sample=0; sample<available; sample++)
-   {
-      const GcTelemetryRecord &record =
-         sgGcTelemetryRecords[(first + sample) % GC_TELEMETRY_CAPACITY];
-      if ( (record.flags & inRequiredFlags) == (unsigned int)inRequiredFlags )
-         values[count++] = record.value[inMetric];
-   }
-
-   if (inStatistic==0)
-      return (double)count;
-   if (!count)
-      return 0.0;
-   if (inStatistic==5)
-      return values[count-1];
-
-   if (inStatistic==4)
-   {
-      double maximum = values[0];
-      for(int i=1;i<count;i++)
-         if (values[i]>maximum)
-            maximum = values[i];
-      return maximum;
-   }
-
-   // Sorting happens only on explicit reads. Insertion sort is deliberately
-   // simple for the bounded 512-value stack buffer and performs no allocation.
-   for(int i=1;i<count;i++)
-   {
-      double value = values[i];
-      int pos = i;
-      while(pos>0 && values[pos-1]>value)
-      {
-         values[pos] = values[pos-1];
-         pos--;
-      }
-      values[pos] = value;
-   }
-
-   int perMille = inStatistic==1 ? 500 : inStatistic==2 ? 990 : 999;
-   int rank = (count*perMille + 999) / 1000 - 1;
-   if (rank<0)
-      rank = 0;
-   if (rank>=count)
-      rank = count-1;
-   return values[rank];
-}
-
-int __hxcpp_gc_telemetry_last_flags()
-{
-   unsigned int written = sgGcTelemetryWritten;
-   if (!written)
-      return 0;
-   return (int)sgGcTelemetryRecords[(written-1) % GC_TELEMETRY_CAPACITY].flags;
-}
-
-void __hxcpp_gc_telemetry_reset()
-{
-   // Deliberately independent from enterGameplay: pause/resume may enter the
-   // mode more than once and must not discard earlier song samples.
-   sgGcTelemetryWritten = 0;
 }
 
 
