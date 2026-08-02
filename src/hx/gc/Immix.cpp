@@ -7296,7 +7296,7 @@ static size_t __hxcpp_process_used_bytes()
    }
 
    return 0;
-   #elif defined(HX_MACOS) || defined(HX_IOS)
+   #elif defined(HX_MACOS) || defined(IPHONE) || defined(APPLETV) || defined(HX_APPLEWATCH)
    mach_task_basic_info info;
    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
